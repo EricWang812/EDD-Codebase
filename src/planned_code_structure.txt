@@ -1,0 +1,9 @@
+single button -> either be recording or playing back audio
+
+on press -> start recording a language
+on press 2 -> translate and play back the audio, then listen
+on press 3 -> translate back, then listen and continue
+if there is no button press in 15 ish? seconds then turn off the module, and wait until next button press
+
+on holding the button -> somehow select the language desired, by detecting text spoken in that foreign language
+    one language will always be english
