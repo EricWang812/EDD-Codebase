@@ -14,10 +14,14 @@ import subprocess
 import argostranslate.package
 import argostranslate.translate
 
+import whisper
+
+model = whisper.load_model("small")
+
 #Global Variables
 conversation_active = False
-foreign_language = "es"  #this needs to be changed relative to their languge of choice/spoken
-common_language = "en" 
+from_language = "es"  #this needs to be changed relative to their languge of choice/spoken
+to_language = "en" 
 button_held = False
 
 
@@ -103,8 +107,23 @@ def start_recording():
                '-f', 'S16_LE', '-r', '16000', '-c', '2', REC_FILE]
     recording_process = subprocess.Popen(command)
 
+def start_recording_language_set():
+    """Enter recording stage: display test1.jpg and start arecord"""
+    global recording_process, img1_data
+    print(">>> Status: Entering recording stage (displaying test1)...")
+    print(">>> Press the button to stop recording and playback...")
 
-def on_button_pressed():
+    if img1_data:
+        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img1_data)
+
+    # Start recording asynchronously
+    command = ['arecord', '-D', 'hw:wm8960soundcard',
+               '-f', 'S16_LE', '-r', '16000', '-c', '2', REC_FILE]
+    button_held = True
+    recording_process = subprocess.Popen(command)
+
+
+def on_button_release():
     """Button callback: stop recording -> color change -> display test2 -> play recording (blocking) -> return to recording"""
     global recording_process, img1_data, img2_data
     print(">>> Button pressed!")
@@ -130,24 +149,44 @@ def on_button_pressed():
     print(">>> Playing back recording (displaying test2)...")
     subprocess.run(['aplay', '-D', 'plughw:wm8960soundcard', REC_FILE])
 
-    # 4. Automatically return to recording stage
-    start_recording()
+def setup_languages(audio):
+    result = model.transcribe(audio)
+    if from_language != "en": from_language = result["language"]
+    else: to_language = result["language"]
 
-#adjust the langauge based on the language spoken when the button is being held
-def on_button_held():
-    """Button hold callback: toggle conversation mode"""
-    global conversation_active, foreign_language, common_language
-    conversation_active = not conversation_active
-    if conversation_active:
-        print(">>> Conversation mode activated.")
-        # Additional logic for starting conversation mode can be added here
-    else:
-        print(">>> Conversation mode deactivated.")
-        # Additional logic for stopping conversation mode can be added here
+def setup_translation():
+    import argostranslate.package
+    import argostranslate.translate
+
+    # Download and install Argos Translate package
+    argostranslate.package.update_package_index()
+    available_packages = argostranslate.package.get_available_packages()
+    available_package = list(
+        filter(
+            lambda x: x.from_code == from_language and x.to_code == to_language, available_packages
+        )
+    )[0]
+    download_path = available_package.download()
+    argostranslate.package.install_from_path(download_path)
+
+    # Translate
+    installed_languages = argostranslate.translate.get_installed_languages()
+    from_lang = list(filter(
+            lambda x: x.code == from_language,
+            installed_languages))[0]
+    to_lang = list(filter(
+            lambda x: x.code == to_language,
+            installed_languages))[0]
+
+def swap():
+    global from_language, to_language
+    from_language, to_language = to_language, from_language
 
 
 # Register callback
-board.on_button_press(on_button_pressed)
+board.on_button_press(start_recording)
+board.on_button_release(on_button_release)
+board.on_button_hold(start_recording_language_set)
 
 
 
