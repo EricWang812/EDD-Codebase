@@ -41,6 +41,7 @@ board.set_backlight(50)
 img1_data = None  # Recording stage (test1.jpg)
 img2_data = None  # Playback stage (test2.jpg)
 REC_FILE = "data/recorded_voice.wav"
+TRANSLATED_FILE = ""
 recording_process = None
 
 
@@ -93,19 +94,27 @@ def set_wm8960_volume_stable(volume_level: str):
         print(f"ERROR: Failed to set volume: {e}")
 
 
-def start_recording():
-    """Enter recording stage: display test1.jpg and start arecord"""
-    global recording_process, img1_data
-    print(">>> Status: Entering recording stage (displaying test1)...")
-    print(">>> Press the button to stop recording and playback...")
+def start_end_recording():
 
-    if img1_data:
-        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img1_data)
+    global conversation_active
+    conversation_active = not conversation_active
 
-    # Start recording asynchronously
-    command = ['arecord', '-D', 'hw:wm8960soundcard',
-               '-f', 'S16_LE', '-r', '16000', '-c', '2', REC_FILE]
-    recording_process = subprocess.Popen(command)
+    if conversation_active:
+        on_end()
+    
+    else:
+        """Enter recording stage: display test1.jpg and start arecord"""
+        global recording_process, img1_data
+        print(">>> Status: Entering recording stage (displaying test1)...")
+        print(">>> Press the button to stop recording and playback...")
+
+        if img1_data:
+            board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img1_data)
+
+        # Start recording asynchronously
+        command = ['arecord', '-D', 'hw:wm8960soundcard',
+                '-f', 'S16_LE', '-r', '16000', '-c', '2', REC_FILE]
+        recording_process = subprocess.Popen(command)
 
 def start_recording_language_set():
     """Enter recording stage: display test1.jpg and start arecord"""
@@ -123,8 +132,8 @@ def start_recording_language_set():
     recording_process = subprocess.Popen(command)
 
 
-def on_button_release():
-    """Button callback: stop recording -> color change -> display test2 -> play recording (blocking) -> return to recording"""
+def on_end():
+    """Button callback: stop recording -> color change -> display something -> play translated recording"""
     global recording_process, img1_data, img2_data
     print(">>> Button pressed!")
 
@@ -139,7 +148,7 @@ def on_button_release():
     for r, g, b, hex_code in color_sequence:
         board.fill_screen(hex_code)
         board.set_rgb(r, g, b)
-        sleep(0.4)
+        sleep(0.3)
     board.set_rgb(0, 0, 0)
 
     # 3. Playback feedback: display test2.jpg and play recorded audio
@@ -147,6 +156,7 @@ def on_button_release():
         board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img2_data)
 
     print(">>> Playing back recording (displaying test2)...")
+
     subprocess.run(['aplay', '-D', 'plughw:wm8960soundcard', REC_FILE])
 
 def setup_languages(audio):
@@ -155,9 +165,6 @@ def setup_languages(audio):
     else: to_language = result["language"]
 
 def setup_translation():
-    import argostranslate.package
-    import argostranslate.translate
-
     # Download and install Argos Translate package
     argostranslate.package.update_package_index()
     available_packages = argostranslate.package.get_available_packages()
@@ -177,6 +184,9 @@ def setup_translation():
     to_lang = list(filter(
             lambda x: x.code == to_language,
             installed_languages))[0]
+    translationForeign = from_lang.get_translation(to_lang)
+    translationCommon = to_lang.get_translation(from_lang)
+    return translationForeign, translationCommon
 
 def swap():
     global from_language, to_language
@@ -184,7 +194,7 @@ def swap():
 
 
 # Register callback
-board.on_button_press(start_recording)
+board.on_button_press(start_end_recording)
 board.on_button_release(on_button_release)
 board.on_button_hold(start_recording_language_set)
 
@@ -219,7 +229,7 @@ try:
             ['aplay', '-D', 'plughw:wm8960soundcard', args.test_wav])
 
     # 4. After audio finishes, enter recording loop
-    start_recording()
+    # start_recording()
 
     while True:
         sleep(0.1)
