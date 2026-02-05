@@ -6,6 +6,7 @@
 
 import time
 from time import sleep
+from unittest import result
 from PIL import Image
 import sys
 import os
@@ -15,6 +16,10 @@ import argostranslate.package
 import argostranslate.translate
 
 import whisper
+import pyttsx3
+
+
+engine = pyttsx3.init()
 
 model = whisper.load_model("small")
 
@@ -119,6 +124,7 @@ def start_end_recording():
 def start_recording_language_set():
     """Enter recording stage: display test1.jpg and start arecord"""
     global recording_process, img1_data
+
     print(">>> Status: Entering recording stage (displaying test1)...")
     print(">>> Press the button to stop recording and playback...")
 
@@ -131,6 +137,13 @@ def start_recording_language_set():
     button_held = True
     recording_process = subprocess.Popen(command)
 
+def release_and_set():
+    global recording_process, from_language, to_language, button_held
+    if button_held:
+        if recording_process and recording_process.poll() is None:
+            recording_process.terminate()
+            recording_process.wait()
+        from_language, to_language = set_languages(REC_FILE)
 
 def on_end():
     """Button callback: stop recording -> color change -> display something -> play translated recording"""
@@ -156,15 +169,32 @@ def on_end():
         board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img2_data)
 
     print(">>> Playing back recording (displaying test2)...")
+    translation = get_translations(from_language, to_language)
+    swap()
+    result = model.transcribe(REC_FILE)
+    print(result["text"])
+    translation_audio = translation.translate_file(result["text"])
+    engine.say(translation_audio)
+    engine.runAndWait()
+    # subprocess.run(['aplay', '-D', 'plughw:wm8960soundcard', translation_audio])
 
-    subprocess.run(['aplay', '-D', 'plughw:wm8960soundcard', REC_FILE])
+    # subprocess.run(['aplay', '-D', 'plughw:wm8960soundcard', REC_FILE])
 
-def setup_languages(audio):
+def set_languages(audio):
+    global from_language, to_language
     result = model.transcribe(audio)
     if from_language != "en": from_language = result["language"]
     else: to_language = result["language"]
+    translateF, translateC = setup_translation()
+    return translateF, translateC
+
+def get_translations(fromL, toL):
+    return fromL.get_translation(toL)
+
 
 def setup_translation():
+
+    global from_language, to_language, from_lang, to_lang
     # Download and install Argos Translate package
     argostranslate.package.update_package_index()
     available_packages = argostranslate.package.get_available_packages()
@@ -189,13 +219,14 @@ def setup_translation():
     return translationForeign, translationCommon
 
 def swap():
-    global from_language, to_language
+    global from_language, to_language, from_lang, to_lang
     from_language, to_language = to_language, from_language
+    return from_lang.get_translation(to_lang), to_lang.get_translation(from_lang)
 
 
 # Register callback
 board.on_button_press(start_end_recording)
-board.on_button_release(on_button_release)
+board.on_button_release(release_and_set)
 board.on_button_hold(start_recording_language_set)
 
 
@@ -240,3 +271,4 @@ finally:
     if recording_process:
         recording_process.terminate()
     board.cleanup()
+print("buh-bye!")
