@@ -271,13 +271,233 @@
 #     board.cleanup()
 # print("buh-bye!")
 
-#########################################################################
+#########################################################################################################################################
 # GPT VERSION???
 
+# import sys
+# import os
+# import argparse
+# import subprocess
+# from time import sleep
+# from enum import Enum
+
+# from PIL import Image
+# import whisper
+# import pyttsx3
+# import argostranslate.package
+# import argostranslate.translate
+
+# # ======================================================
+# # STATE MACHINE
+# # ======================================================
+
+# class State(Enum):
+#     IDLE = 0
+#     RECORDING = 1
+#     LANG_SELECT = 2
+
+# state = State.IDLE
+# recording_process = None
+
+# # ======================================================
+# # CONFIG
+# # ======================================================
+
+# REC_FILE = "data/recorded_voice.wav"
+
+# from_lang_code = "es"
+# to_lang_code = "en"
+
+# # ======================================================
+# # INIT
+# # ======================================================
+
+# engine = pyttsx3.init()
+# model = whisper.load_model("small")
+
+# # ======================================================
+# # HARDWARE DRIVER
+# # ======================================================
+
+# sys.path.append(os.path.abspath("../Driver"))
+# from WhisPlay import WhisPlayBoard
+
+# board = WhisPlayBoard()
+# board.set_backlight(50)
+
+# img_record = None
+# img_play = None
+
+# # ======================================================
+# # IMAGE UTILS
+# # ======================================================
+
+# def load_jpg_as_rgb565(path, w, h):
+#     img = Image.open(path).convert("RGB").resize((w, h))
+#     buf = []
+#     for y in range(h):
+#         for x in range(w):
+#             r, g, b = img.getpixel((x, y))
+#             rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+#             buf.extend([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF])
+#     return buf
+
+# # ======================================================
+# # AUDIO
+# # ======================================================
+
+# def set_volume(level="121"):
+#     subprocess.run(
+#         ["amixer", "-D", "hw:wm8960soundcard", "sset", "Speaker", level],
+#         capture_output=True
+#     )
+
+# def start_recording():
+#     global recording_process
+#     recording_process = subprocess.Popen([
+#         "arecord",
+#         "-D", "hw:wm8960soundcard",
+#         "-f", "S16_LE",
+#         "-r", "16000",
+#         "-c", "1",
+#         REC_FILE
+#     ])
+
+# def stop_recording():
+#     global recording_process
+#     if recording_process and recording_process.poll() is None:
+#         recording_process.terminate()
+#         recording_process.wait()
+#     recording_process = None
+
+# # ======================================================
+# # ARGOS TRANSLATION
+# # ======================================================
+
+# def setup_translation():
+#     argostranslate.package.update_package_index()
+#     packages = argostranslate.package.get_available_packages()
+
+#     pkg = next(
+#         p for p in packages
+#         if p.from_code == from_lang_code and p.to_code == to_lang_code
+#     )
+
+#     argostranslate.package.install_from_path(pkg.download())
+
+#     langs = argostranslate.translate.get_installed_languages()
+#     src = next(l for l in langs if l.code == from_lang_code)
+#     dst = next(l for l in langs if l.code == to_lang_code)
+
+#     return src.get_translation(dst)
+
+# translation = setup_translation()
+
+# # ======================================================
+# # TRANSLATE + SPEAK
+# # ======================================================
+
+# def translate_and_speak():
+#     board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_play)
+
+#     result = model.transcribe(REC_FILE)
+#     text = result["text"]
+
+#     print(">>> Transcribed:", text)
+
+#     translated = translation.translate(text)
+
+#     print(">>> Translated:", translated)
+
+#     engine.say(translated)
+#     engine.runAndWait()
+
+# # ======================================================
+# # LANGUAGE SET (HOLD)
+# # ======================================================
+
+# def finish_language_select():
+#     global from_lang_code, translation
+
+#     stop_recording()
+
+#     result = model.transcribe(REC_FILE)
+#     detected = result["language"]
+
+#     from_lang_code = detected
+#     print(f">>> Source language set to: {from_lang_code}")
+
+#     translation = setup_translation()
+
+# # ======================================================
+# # BUTTON CALLBACKS
+# # ======================================================
+
+# def on_button_press():
+#     global state
+
+#     if state == State.IDLE:
+#         state = State.RECORDING
+#         board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_record)
+#         start_recording()
+#         print(">>> Recording started")
+
+#     elif state == State.RECORDING:
+#         stop_recording()
+#         state = State.IDLE
+#         print(">>> Recording stopped")
+#         translate_and_speak()
+
+# def on_button_hold():
+#     global state
+
+#     if state == State.IDLE:
+#         state = State.LANG_SELECT
+#         board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_record)
+#         start_recording()
+#         print(">>> Language select recording...")
+
+# def on_button_release():
+#     global state
+
+#     if state == State.LANG_SELECT:
+#         finish_language_select()
+#         state = State.IDLE
+
+# # ======================================================
+# # MAIN
+# # ======================================================
+
+# parser = argparse.ArgumentParser()
+# parser.add_argument("--img_record", default="data/recording.jpg")
+# parser.add_argument("--img_play", default="data/playing.jpg")
+# args = parser.parse_args()
+
+# img_record = load_jpg_as_rgb565(
+#     args.img_record, board.LCD_WIDTH, board.LCD_HEIGHT
+# )
+# img_play = load_jpg_as_rgb565(
+#     args.img_play, board.LCD_WIDTH, board.LCD_HEIGHT
+# )
+
+# set_volume()
+
+# board.on_button_press(on_button_press)
+# board.on_button_hold(on_button_hold)
+# board.on_button_release(on_button_release)
+
+# try:
+#     while True:
+#         sleep(0.1)
+# except KeyboardInterrupt:
+#     stop_recording()
+#     board.cleanup()
+###########################################################################################################################
 import sys
 import os
 import argparse
 import subprocess
+import time
 from time import sleep
 from enum import Enum
 
@@ -298,6 +518,9 @@ class State(Enum):
 
 state = State.IDLE
 recording_process = None
+hold_duration = 1.0
+start_time = 0.0
+end_time = 0.0
 
 # ======================================================
 # CONFIG
@@ -434,19 +657,15 @@ def finish_language_select():
 # ======================================================
 
 def on_button_press():
-    global state
-
-    if state == State.IDLE:
-        state = State.RECORDING
-        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_record)
-        start_recording()
-        print(">>> Recording started")
-
-    elif state == State.RECORDING:
+    global state, start_time
+    if state == State.RECORDING:
         stop_recording()
         state = State.IDLE
         print(">>> Recording stopped")
         translate_and_speak()
+    else:
+        start_time = time.time()
+
 
 def on_button_hold():
     global state
@@ -458,9 +677,15 @@ def on_button_hold():
         print(">>> Language select recording...")
 
 def on_button_release():
-    global state
-
-    if state == State.LANG_SELECT:
+    global state, start_time
+    if (time.time() - start_time) / 1000.0 > hold_duration:
+        on_button_hold()
+    elif state == State.IDLE:
+        state = State.RECORDING
+        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_record)
+        start_recording()
+        print(">>> Recording started")
+    elif state == State.LANG_SELECT:
         finish_language_select()
         state = State.IDLE
 
@@ -483,7 +708,7 @@ img_play = load_jpg_as_rgb565(
 set_volume()
 
 board.on_button_press(on_button_press)
-board.on_button_hold(on_button_hold)
+# board.on_button_hold(on_button_hold)
 board.on_button_release(on_button_release)
 
 try:
