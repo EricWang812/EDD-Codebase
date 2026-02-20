@@ -518,10 +518,10 @@ class State(Enum):
 
 state = State.IDLE
 recording_process = None
+
+# Hold timing (seconds)
 hold_duration = 1.0
 start_time = 0.0
-end_time = 0.0
-
 # ======================================================
 # CONFIG
 # ======================================================
@@ -636,7 +636,7 @@ def translate_and_speak():
     engine.runAndWait()
 
 # ======================================================
-# LANGUAGE SET (HOLD)
+# LANGUAGE MODE
 # ======================================================
 
 def finish_language_select():
@@ -653,41 +653,51 @@ def finish_language_select():
     translation = setup_translation()
 
 # ======================================================
+# SCREEN OUTPUTS
+# ======================================================
+
+def set_image():
+    global state
+    
+
+# ======================================================
 # BUTTON CALLBACKS
 # ======================================================
 
 def on_button_press():
-    global state, start_time
-    if state == State.RECORDING:
-        stop_recording()
-        state = State.IDLE
-        print(">>> Recording stopped")
-        translate_and_speak()
-    else:
-        start_time = time.time()
+    global start_time
+    start_time = time.time()
 
-
-def on_button_hold():
-    global state
-
-    if state == State.IDLE:
-        state = State.LANG_SELECT
-        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_record)
-        start_recording()
-        print(">>> Language select recording...")
 
 def on_button_release():
     global state, start_time
-    if (time.time() - start_time) / 1000.0 > hold_duration:
-        on_button_hold()
-    elif state == State.IDLE:
-        state = State.RECORDING
-        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_record)
-        start_recording()
-        print(">>> Recording started")
-    elif state == State.LANG_SELECT:
-        finish_language_select()
-        state = State.IDLE
+
+    duration = time.time() - start_time
+
+    if duration >= hold_duration:
+
+        if state == State.IDLE:
+            state = State.LANG_SELECT
+            board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_record)
+            start_recording()
+            print("Entered Language Select Mode")
+
+        elif state == State.LANG_SELECT:
+            finish_language_select()
+            state = State.IDLE
+            print("Exited Language Select Mode")
+
+    else:
+        if state == State.IDLE:
+            state = State.RECORDING
+            board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_record)
+            start_recording()
+            print("Recording started")
+        elif state == State.RECORDING:
+            stop_recording()
+            state = State.IDLE
+            print("Recording stopped")
+            translate_and_speak()
 
 # ======================================================
 # MAIN
@@ -708,12 +718,15 @@ img_play = load_jpg_as_rgb565(
 set_volume()
 
 board.on_button_press(on_button_press)
-# board.on_button_hold(on_button_hold)
 board.on_button_release(on_button_release)
 
 try:
     while True:
         sleep(0.1)
+
+
+
 except KeyboardInterrupt:
+    print("Exiting program...")
     stop_recording()
     board.cleanup()

@@ -24,13 +24,10 @@ playing = False  # Global variable to track if sound is playing
 def press():
     print("pressed")
 
-def held():
-    print("held")
 
 def release():
     print("release")
 
 # Register button event
 board.on_button_press(press)
-board.on_button_hold(held)
 board.on_button_release(release)
