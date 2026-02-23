@@ -515,6 +515,7 @@ class State(Enum):
     IDLE = 0
     RECORDING = 1
     LANG_SELECT = 2
+    OUTPUTING = 3
 
 state = State.IDLE
 recording_process = None
@@ -555,15 +556,43 @@ img_play = None
 # IMAGE UTILS
 # ======================================================
 
-def load_jpg_as_rgb565(path, w, h):
-    img = Image.open(path).convert("RGB").resize((w, h))
-    buf = []
-    for y in range(h):
-        for x in range(w):
-            r, g, b = img.getpixel((x, y))
+def load_jpg_as_rgb565(filepath, screen_width, screen_height):
+    img = Image.open(filepath).convert('RGB')
+    original_width, original_height = img.size
+
+    aspect_ratio = original_width / original_height
+    screen_aspect_ratio = screen_width / screen_height
+
+    if aspect_ratio > screen_aspect_ratio:
+        # Original image is wider, scale based on screen height
+        new_height = screen_height
+        new_width = int(new_height * aspect_ratio)
+        resized_img = img.resize((new_width, new_height))
+        # Calculate horizontal offset to center the image
+        offset_x = (new_width - screen_width) // 2
+        # Crop the image to fit screen width
+        cropped_img = resized_img.crop(
+            (offset_x, 0, offset_x + screen_width, screen_height))
+    else:
+        # Original image is taller or has the same aspect ratio, scale based on screen width
+        new_width = screen_width
+        new_height = int(new_width / aspect_ratio)
+        resized_img = img.resize((new_width, new_height))
+        # Calculate vertical offset to center the image
+        offset_y = (new_height - screen_height) // 2
+        # Crop the image to fit screen height
+        cropped_img = resized_img.crop(
+            (0, offset_y, screen_width, offset_y + screen_height))
+
+    pixel_data = []
+    for y in range(screen_height):
+        for x in range(screen_width):
+            r, g, b = cropped_img.getpixel((x, y))
             rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-            buf.extend([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF])
-    return buf
+            pixel_data.extend([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF])
+
+    return pixel_data
+
 
 # ======================================================
 # AUDIO
@@ -658,6 +687,20 @@ def finish_language_select():
 
 def set_image():
     global state
+    image_filepath = "imgs/passive.jpg"
+    if state == State.IDLE:
+        image_filepath = "imgs/passive.jpg"
+    elif state == State.RECORDING:
+        image_filepath = "imgs/recording.jpg"
+    elif state == State.LANG_SELECT:
+        image_filepath = "imgs/listening.jpg"
+    elif state == State.OUTPUTING:
+        image_filepath = "imgs/playing.jpg"
+
+    global_image_data = load_jpg_as_rgb565(
+        image_filepath, board.LCD_WIDTH, board.LCD_HEIGHT)
+    board.draw_image(0, 0, board.LCD_WIDTH,
+                     board.LCD_HEIGHT, global_image_data)
     
 
 # ======================================================
@@ -678,26 +721,31 @@ def on_button_release():
 
         if state == State.IDLE:
             state = State.LANG_SELECT
-            board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_record)
+            set_image()
             start_recording()
             print("Entered Language Select Mode")
 
         elif state == State.LANG_SELECT:
             finish_language_select()
             state = State.IDLE
+            set_image()
             print("Exited Language Select Mode")
 
     else:
         if state == State.IDLE:
             state = State.RECORDING
-            board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_record)
+            set_image()
             start_recording()
             print("Recording started")
         elif state == State.RECORDING:
             stop_recording()
-            state = State.IDLE
+            state = State.OUTPUTING
+            set_image()
             print("Recording stopped")
             translate_and_speak()
+            state = State.IDLE
+            set_image()
+            print("Returned to Idle Mode")
 
 # ======================================================
 # MAIN
