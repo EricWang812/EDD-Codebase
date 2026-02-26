@@ -493,6 +493,293 @@
 #     stop_recording()
 #     board.cleanup()
 ###########################################################################################################################
+# import sys
+# import os
+# import argparse
+# import subprocess
+# import time
+# from time import sleep
+# from enum import Enum
+
+# from PIL import Image
+# import whisper
+# import pyttsx3
+# import argostranslate.package
+# import argostranslate.translate
+
+# # ======================================================
+# # STATE MACHINE
+# # ======================================================
+
+# class State(Enum):
+#     IDLE = 0
+#     RECORDING = 1
+#     LANG_SELECT = 2
+#     OUTPUTING = 3
+
+# state = State.IDLE
+# recording_process = None
+
+# # Hold timing (seconds)
+# hold_duration = 1.0
+# start_time = 0.0
+# # ======================================================
+# # CONFIG
+# # ======================================================
+
+# REC_FILE = "data/recorded_voice.wav"
+
+# from_lang_code = "es"
+# to_lang_code = "en"
+
+# # ======================================================
+# # INIT
+# # ======================================================
+
+# engine = pyttsx3.init()
+# model = whisper.load_model("small")
+
+# # ======================================================
+# # HARDWARE DRIVER
+# # ======================================================
+
+# sys.path.append(os.path.abspath("../Driver"))
+# from WhisPlay import WhisPlayBoard
+
+# board = WhisPlayBoard()
+# board.set_backlight(50)
+
+# img_record = None
+# img_play = None
+
+# # ======================================================
+# # IMAGE UTILS
+# # ======================================================
+
+# def load_jpg_as_rgb565(filepath, screen_width, screen_height):
+#     img = Image.open(filepath).convert('RGB')
+#     original_width, original_height = img.size
+
+#     aspect_ratio = original_width / original_height
+#     screen_aspect_ratio = screen_width / screen_height
+
+#     if aspect_ratio > screen_aspect_ratio:
+#         # Original image is wider, scale based on screen height
+#         new_height = screen_height
+#         new_width = int(new_height * aspect_ratio)
+#         resized_img = img.resize((new_width, new_height))
+#         # Calculate horizontal offset to center the image
+#         offset_x = (new_width - screen_width) // 2
+#         # Crop the image to fit screen width
+#         cropped_img = resized_img.crop(
+#             (offset_x, 0, offset_x + screen_width, screen_height))
+#     else:
+#         # Original image is taller or has the same aspect ratio, scale based on screen width
+#         new_width = screen_width
+#         new_height = int(new_width / aspect_ratio)
+#         resized_img = img.resize((new_width, new_height))
+#         # Calculate vertical offset to center the image
+#         offset_y = (new_height - screen_height) // 2
+#         # Crop the image to fit screen height
+#         cropped_img = resized_img.crop(
+#             (0, offset_y, screen_width, offset_y + screen_height))
+
+#     pixel_data = []
+#     for y in range(screen_height):
+#         for x in range(screen_width):
+#             r, g, b = cropped_img.getpixel((x, y))
+#             rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+#             pixel_data.extend([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF])
+
+#     return pixel_data
+
+
+# # ======================================================
+# # AUDIO
+# # ======================================================
+
+# def set_volume(level="121"):
+#     subprocess.run(
+#         ["amixer", "-D", "hw:wm8960soundcard", "sset", "Speaker", level],
+#         capture_output=True
+#     )
+
+# def start_recording():
+#     global recording_process
+#     recording_process = subprocess.Popen([
+#         "arecord",
+#         "-D", "hw:wm8960soundcard",
+#         "-f", "S16_LE",
+#         "-r", "16000",
+#         "-c", "1",
+#         REC_FILE
+#     ])
+
+# def stop_recording():
+#     global recording_process
+#     if recording_process and recording_process.poll() is None:
+#         recording_process.terminate()
+#         recording_process.wait()
+#     recording_process = None
+
+# # ======================================================
+# # ARGOS TRANSLATION
+# # ======================================================
+
+# def setup_translation():
+#     argostranslate.package.update_package_index()
+#     packages = argostranslate.package.get_available_packages()
+
+#     pkg = next(
+#         p for p in packages
+#         if p.from_code == from_lang_code and p.to_code == to_lang_code
+#     )
+
+#     argostranslate.package.install_from_path(pkg.download())
+
+#     langs = argostranslate.translate.get_installed_languages()
+#     src = next(l for l in langs if l.code == from_lang_code)
+#     dst = next(l for l in langs if l.code == to_lang_code)
+
+#     return src.get_translation(dst)
+
+# translation = setup_translation()
+
+# # ======================================================
+# # TRANSLATE + SPEAK
+# # ======================================================
+
+# def translate_and_speak():
+#     board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_play)
+
+#     result = model.transcribe(REC_FILE)
+#     text = result["text"]
+
+#     print(">>> Transcribed:", text)
+
+#     translated = translation.translate(text)
+
+#     print(">>> Translated:", translated)
+
+#     engine.say(translated)
+#     engine.runAndWait()
+
+# # ======================================================
+# # LANGUAGE MODE
+# # ======================================================
+
+# def finish_language_select():
+#     global from_lang_code, translation
+
+#     stop_recording()
+
+#     result = model.transcribe(REC_FILE)
+#     detected = result["language"]
+
+#     from_lang_code = detected
+#     print(f">>> Source language set to: {from_lang_code}")
+
+#     translation = setup_translation()
+
+# # ======================================================
+# # SCREEN OUTPUTS
+# # ======================================================
+
+# def set_image():
+#     global state
+#     image_filepath = "imgs/passive.jpg"
+#     if state == State.IDLE:
+#         image_filepath = "imgs/passive.jpg"
+#     elif state == State.RECORDING:
+#         image_filepath = "imgs/recording.jpg"
+#     elif state == State.LANG_SELECT:
+#         image_filepath = "imgs/listening.jpg"
+#     elif state == State.OUTPUTING:
+#         image_filepath = "imgs/playing.jpg"
+
+#     global_image_data = load_jpg_as_rgb565(
+#         image_filepath, board.LCD_WIDTH, board.LCD_HEIGHT)
+#     board.draw_image(0, 0, board.LCD_WIDTH,
+#                      board.LCD_HEIGHT, global_image_data)
+    
+
+# # ======================================================
+# # BUTTON CALLBACKS
+# # ======================================================
+
+# def on_button_press():
+#     global start_time
+#     start_time = time.time()
+
+
+# def on_button_release():
+#     global state, start_time
+
+#     duration = time.time() - start_time
+
+#     if duration >= hold_duration:
+
+#         if state == State.IDLE:
+#             state = State.LANG_SELECT
+#             set_image()
+#             start_recording()
+#             print("Entered Language Select Mode")
+
+#         elif state == State.LANG_SELECT:
+#             finish_language_select()
+#             state = State.IDLE
+#             set_image()
+#             print("Exited Language Select Mode")
+
+#     else:
+#         if state == State.IDLE:
+#             state = State.RECORDING
+#             set_image()
+#             start_recording()
+#             print("Recording started")
+#         elif state == State.RECORDING:
+#             stop_recording()
+#             state = State.OUTPUTING
+#             set_image()
+#             print("Recording stopped")
+#             translate_and_speak()
+#             state = State.IDLE
+#             set_image()
+#             print("Returned to Idle Mode")
+
+# # ======================================================
+# # MAIN
+# # ======================================================
+
+# parser = argparse.ArgumentParser()
+# parser.add_argument("--img_record", default="data/recording.jpg")
+# parser.add_argument("--img_play", default="data/playing.jpg")
+# args = parser.parse_args()
+
+# img_record = load_jpg_as_rgb565(
+#     args.img_record, board.LCD_WIDTH, board.LCD_HEIGHT
+# )
+# img_play = load_jpg_as_rgb565(
+#     args.img_play, board.LCD_WIDTH, board.LCD_HEIGHT
+# )
+
+# set_volume()
+
+# board.on_button_press(on_button_press)
+# board.on_button_release(on_button_release)
+
+# try:
+#     while True:
+#         sleep(0.1)
+
+
+
+# except KeyboardInterrupt:
+#     print("Exiting program...")
+#     stop_recording()
+#     board.cleanup()
+
+
 import sys
 import os
 import argparse
@@ -500,12 +787,16 @@ import subprocess
 import time
 from time import sleep
 from enum import Enum
+import json
+import wave
 
 from PIL import Image
-import whisper
 import pyttsx3
+
 import argostranslate.package
 import argostranslate.translate
+
+from vosk import Model, KaldiRecognizer
 
 # ======================================================
 # STATE MACHINE
@@ -523,21 +814,43 @@ recording_process = None
 # Hold timing (seconds)
 hold_duration = 1.0
 start_time = 0.0
+
 # ======================================================
 # CONFIG
 # ======================================================
 
 REC_FILE = "data/recorded_voice.wav"
 
-from_lang_code = "es"
+# Vosk model path (folder you unzipped)
+# Example: "vosk-model-small-multilingual-0.4"
+VOSK_MODEL_PATH = "vosk-model-small-multilingual-0.4"
+
+# Output language (what you want to speak)
 to_lang_code = "en"
+
+# Language cycle for "language select" mode (edit this!)
+# These MUST match Argos language codes you have packages for.
+LANG_CYCLE = ["es", "fr", "de", "it", "pt", "en"]
+
+# Start default
+from_lang_code = "es"
 
 # ======================================================
 # INIT
 # ======================================================
 
+os.makedirs("data", exist_ok=True)
+
 engine = pyttsx3.init()
-model = whisper.load_model("small")
+
+# Load Vosk once
+if not os.path.isdir(VOSK_MODEL_PATH):
+    raise RuntimeError(
+        f"Vosk model folder not found: '{VOSK_MODEL_PATH}'. "
+        "Download + unzip a Vosk model and set VOSK_MODEL_PATH correctly."
+    )
+
+vosk_model = Model(VOSK_MODEL_PATH)
 
 # ======================================================
 # HARDWARE DRIVER
@@ -564,25 +877,17 @@ def load_jpg_as_rgb565(filepath, screen_width, screen_height):
     screen_aspect_ratio = screen_width / screen_height
 
     if aspect_ratio > screen_aspect_ratio:
-        # Original image is wider, scale based on screen height
         new_height = screen_height
         new_width = int(new_height * aspect_ratio)
         resized_img = img.resize((new_width, new_height))
-        # Calculate horizontal offset to center the image
         offset_x = (new_width - screen_width) // 2
-        # Crop the image to fit screen width
-        cropped_img = resized_img.crop(
-            (offset_x, 0, offset_x + screen_width, screen_height))
+        cropped_img = resized_img.crop((offset_x, 0, offset_x + screen_width, screen_height))
     else:
-        # Original image is taller or has the same aspect ratio, scale based on screen width
         new_width = screen_width
         new_height = int(new_width / aspect_ratio)
         resized_img = img.resize((new_width, new_height))
-        # Calculate vertical offset to center the image
         offset_y = (new_height - screen_height) // 2
-        # Crop the image to fit screen height
-        cropped_img = resized_img.crop(
-            (0, offset_y, screen_width, offset_y + screen_height))
+        cropped_img = resized_img.crop((0, offset_y, screen_width, offset_y + screen_height))
 
     pixel_data = []
     for y in range(screen_height):
@@ -592,7 +897,6 @@ def load_jpg_as_rgb565(filepath, screen_width, screen_height):
             pixel_data.extend([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF])
 
     return pixel_data
-
 
 # ======================================================
 # AUDIO
@@ -606,6 +910,9 @@ def set_volume(level="121"):
 
 def start_recording():
     global recording_process
+    # Make sure directory exists
+    os.makedirs(os.path.dirname(REC_FILE), exist_ok=True)
+
     recording_process = subprocess.Popen([
         "arecord",
         "-D", "hw:wm8960soundcard",
@@ -623,25 +930,95 @@ def stop_recording():
     recording_process = None
 
 # ======================================================
+# VOSK TRANSCRIPTION
+# ======================================================
+
+def vosk_transcribe_wav(wav_path: str) -> str:
+    """
+    Transcribe a 16kHz mono 16-bit PCM WAV file with Vosk.
+    Returns plain text.
+    """
+    if not os.path.exists(wav_path):
+        return ""
+
+    wf = wave.open(wav_path, "rb")
+
+    # Safety checks: Vosk expects PCM mono
+    if wf.getnchannels() != 1:
+        raise RuntimeError("WAV must be mono (1 channel).")
+    if wf.getsampwidth() != 2:
+        raise RuntimeError("WAV must be 16-bit PCM (sampwidth=2).")
+    # Sample rate can be something else, but best is 16000
+    sample_rate = wf.getframerate()
+
+    rec = KaldiRecognizer(vosk_model, sample_rate)
+    rec.SetWords(False)
+
+    chunks = []
+    while True:
+        data = wf.readframes(4000)
+        if len(data) == 0:
+            break
+        if rec.AcceptWaveform(data):
+            r = json.loads(rec.Result())
+            t = r.get("text", "").strip()
+            if t:
+                chunks.append(t)
+
+    r_final = json.loads(rec.FinalResult())
+    t_final = r_final.get("text", "").strip()
+    if t_final:
+        chunks.append(t_final)
+
+    return " ".join(chunks).strip()
+
+# ======================================================
 # ARGOS TRANSLATION
 # ======================================================
 
+_package_index_updated = False
+
 def setup_translation():
-    argostranslate.package.update_package_index()
-    packages = argostranslate.package.get_available_packages()
+    """
+    Ensure Argos has the from->to language package installed, then return translator.
+    """
+    global _package_index_updated
 
-    pkg = next(
-        p for p in packages
-        if p.from_code == from_lang_code and p.to_code == to_lang_code
-    )
+    if from_lang_code == to_lang_code:
+        # No translation needed, just passthrough
+        return None
 
-    argostranslate.package.install_from_path(pkg.download())
+    if not _package_index_updated:
+        argostranslate.package.update_package_index()
+        _package_index_updated = True
 
+    # Check if translation already installed
     langs = argostranslate.translate.get_installed_languages()
-    src = next(l for l in langs if l.code == from_lang_code)
-    dst = next(l for l in langs if l.code == to_lang_code)
+    src_installed = next((l for l in langs if l.code == from_lang_code), None)
+    dst_installed = next((l for l in langs if l.code == to_lang_code), None)
 
-    return src.get_translation(dst)
+    # If missing, install the package
+    if src_installed is None or dst_installed is None:
+        packages = argostranslate.package.get_available_packages()
+        pkg = next(
+            (p for p in packages if p.from_code == from_lang_code and p.to_code == to_lang_code),
+            None
+        )
+        if pkg is None:
+            raise RuntimeError(f"No Argos package found for {from_lang_code} -> {to_lang_code}")
+
+        # Download + install
+        argostranslate.package.install_from_path(pkg.download())
+
+        # Refresh installed languages after install
+        langs = argostranslate.translate.get_installed_languages()
+        src_installed = next((l for l in langs if l.code == from_lang_code), None)
+        dst_installed = next((l for l in langs if l.code == to_lang_code), None)
+
+    if src_installed is None or dst_installed is None:
+        raise RuntimeError(f"Argos languages not installed correctly for {from_lang_code}->{to_lang_code}")
+
+    return src_installed.get_translation(dst_installed)
 
 translation = setup_translation()
 
@@ -650,14 +1027,26 @@ translation = setup_translation()
 # ======================================================
 
 def translate_and_speak():
+    global translation
+
     board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img_play)
 
-    result = model.transcribe(REC_FILE)
-    text = result["text"]
-
+    text = vosk_transcribe_wav(REC_FILE)
     print(">>> Transcribed:", text)
 
-    translated = translation.translate(text)
+    if not text:
+        engine.say("Sorry, I didn't catch that.")
+        engine.runAndWait()
+        return
+
+    if from_lang_code == to_lang_code:
+        translated = text
+    else:
+        # Ensure translator exists for current language
+        if translation is None:
+            translation = setup_translation()
+
+        translated = translation.translate(text)
 
     print(">>> Translated:", translated)
 
@@ -669,16 +1058,24 @@ def translate_and_speak():
 # ======================================================
 
 def finish_language_select():
+    """
+    With Vosk, we do NOT auto-detect language.
+    Instead, we cycle through preset languages.
+    """
     global from_lang_code, translation
 
     stop_recording()
 
-    result = model.transcribe(REC_FILE)
-    detected = result["language"]
+    # Cycle through preset language list
+    if from_lang_code in LANG_CYCLE:
+        i = LANG_CYCLE.index(from_lang_code)
+        from_lang_code = LANG_CYCLE[(i + 1) % len(LANG_CYCLE)]
+    else:
+        from_lang_code = LANG_CYCLE[0]
 
-    from_lang_code = detected
     print(f">>> Source language set to: {from_lang_code}")
 
+    # Rebuild translation for new language
     translation = setup_translation()
 
 # ======================================================
@@ -698,10 +1095,9 @@ def set_image():
         image_filepath = "imgs/playing.jpg"
 
     global_image_data = load_jpg_as_rgb565(
-        image_filepath, board.LCD_WIDTH, board.LCD_HEIGHT)
-    board.draw_image(0, 0, board.LCD_WIDTH,
-                     board.LCD_HEIGHT, global_image_data)
-    
+        image_filepath, board.LCD_WIDTH, board.LCD_HEIGHT
+    )
+    board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, global_image_data)
 
 # ======================================================
 # BUTTON CALLBACKS
@@ -710,7 +1106,6 @@ def set_image():
 def on_button_press():
     global start_time
     start_time = time.time()
-
 
 def on_button_release():
     global state, start_time
@@ -723,7 +1118,7 @@ def on_button_release():
             state = State.LANG_SELECT
             set_image()
             start_recording()
-            print("Entered Language Select Mode")
+            print("Entered Language Select Mode (recording optional)")
 
         elif state == State.LANG_SELECT:
             finish_language_select()
@@ -737,11 +1132,12 @@ def on_button_release():
             set_image()
             start_recording()
             print("Recording started")
+
         elif state == State.RECORDING:
             stop_recording()
             state = State.OUTPUTING
             set_image()
-            print("Recording stopped")
+            print("Recording stopped -> Translating")
             translate_and_speak()
             state = State.IDLE
             set_image()
@@ -756,12 +1152,8 @@ parser.add_argument("--img_record", default="data/recording.jpg")
 parser.add_argument("--img_play", default="data/playing.jpg")
 args = parser.parse_args()
 
-img_record = load_jpg_as_rgb565(
-    args.img_record, board.LCD_WIDTH, board.LCD_HEIGHT
-)
-img_play = load_jpg_as_rgb565(
-    args.img_play, board.LCD_WIDTH, board.LCD_HEIGHT
-)
+img_record = load_jpg_as_rgb565(args.img_record, board.LCD_WIDTH, board.LCD_HEIGHT)
+img_play = load_jpg_as_rgb565(args.img_play, board.LCD_WIDTH, board.LCD_HEIGHT)
 
 set_volume()
 
@@ -771,8 +1163,6 @@ board.on_button_release(on_button_release)
 try:
     while True:
         sleep(0.1)
-
-
 
 except KeyboardInterrupt:
     print("Exiting program...")
