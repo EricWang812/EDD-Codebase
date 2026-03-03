@@ -1,313 +1,434 @@
 """
-PC Translator Test (Windows)
-Vosk + CTranslate2 OPUS EN<->ZH + pyttsx3
-DUAL-MODEL VERSION:
-- EN→ZH uses opus-en-zh-ct2
-- ZH→EN uses opus-zh-en-ct2
+PC Translator (Windows + Pi) — EN <-> ZH
+Vosk STT  +  CTranslate2 OPUS MT  +  Piper TTS (Python package)
+
+Install deps once:
+    pip install vosk ctranslate2 sentencepiece sounddevice numpy pyttsx3 piper-tts
 """
 
 from __future__ import annotations
-import os
-import sys
-import json
-import wave
-import time
-from dataclasses import dataclass
-from typing import Optional, List
 
+import io
+import json
+import os
+import re
+import sys
+import time
+import wave
+from dataclasses import dataclass
+from typing import List, Optional
+
+import numpy as np
 import pyttsx3
+import sounddevice as sd
 import vosk
 import ctranslate2
 import sentencepiece as spm
 
+# piper-tts Python package — works on both Windows and Pi
+# install: pip install piper-tts
+try:
+    from piper.voice import PiperVoice
+    PIPER_AVAILABLE = True
+except ImportError:
+    PIPER_AVAILABLE = False
 
-# ======================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # Windows UTF-8 fix
-# ======================================================
-
+# ─────────────────────────────────────────────────────────────────────────────
 if os.name == "nt":
     os.system("chcp 65001 >nul")
-
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
-
-# ======================================================
-# PATHS
-# ======================================================
-
-HERE = os.path.dirname(os.path.abspath(__file__))
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths
+# ─────────────────────────────────────────────────────────────────────────────
+HERE       = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(HERE, "models")
-DATA_DIR = os.path.join(HERE, "data")
+DATA_DIR   = os.path.join(HERE, "data")
+VOICES_DIR = os.path.join(HERE, "voices")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-REC_FILE = os.path.join(DATA_DIR, "recorded_voice.wav")
-
-VOSK_EN_DIR = os.path.join(MODELS_DIR, "vosk-en")
-VOSK_ZH_DIR = os.path.join(MODELS_DIR, "vosk-cn")
-
+REC_FILE      = os.path.join(DATA_DIR, "recorded_voice.wav")
+VOSK_EN_DIR   = os.path.join(MODELS_DIR, "vosk-en")
+VOSK_ZH_DIR   = os.path.join(MODELS_DIR, "vosk-cn")
 CT2_EN_ZH_DIR = os.path.join(MODELS_DIR, "opus-en-zh-ct2")
 CT2_ZH_EN_DIR = os.path.join(MODELS_DIR, "opus-zh-en-ct2")
+VOICE_EN      = os.path.join(VOICES_DIR, "en_US-lessac-low.onnx")
+VOICE_ZH      = os.path.join(VOICES_DIR, "zh_CN-huayan-x-low.onnx")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Settings
+# ─────────────────────────────────────────────────────────────────────────────
+CT2_COMPUTE_TYPE       = "int8"
+CT2_BEAM_SIZE          = 2
+CT2_MAX_DECODING_LEN   = 256
+CT2_NO_REPEAT_NGRAM    = 3
+CT2_REPETITION_PENALTY = 1.15
 
-# ======================================================
-# SETTINGS
-# ======================================================
-
-CT2_COMPUTE_TYPE = "int8"
-CT2_BEAM_SIZE = 2
-CT2_MAX_DECODING_LEN = 128
-CT2_NO_REPEAT_NGRAM = 3
-CT2_REPETITION_PENALTY = 1.12
+MIC_SAMPLE_RATE = 16_000
+MIC_CHANNELS    = 1
+MIC_BLOCK_SEC   = 0.25
+SILENCE_TIMEOUT = 2.0
+MAX_RECORD_SEC  = 30
+SILENCE_RMS     = 150
 
 ENABLE_TTS = True
 
-
-# ======================================================
-# Helpers
-# ======================================================
-
-def require_dir(path: str):
-    if not os.path.isdir(path):
-        raise FileNotFoundError(path)
-
-def require_file(path: str):
-    if not os.path.isfile(path):
-        raise FileNotFoundError(path)
-
-def maybe_append_eos(spx: spm.SentencePieceProcessor, toks: List[str]):
-    if spx.piece_to_id("</s>") != spx.unk_id():
-        return toks + ["</s>"]
-    return toks
-
-def strip_special(toks: List[str]):
-    return [t for t in toks if t not in {"</s>", "<s>", "<pad>"}]
-
-
-# ======================================================
-# App State
-# ======================================================
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Data classes
+# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class MTModel:
     translator: ctranslate2.Translator
     sp_src: spm.SentencePieceProcessor
     sp_tgt: spm.SentencePieceProcessor
 
-
 @dataclass
 class AppState:
-    vosk_en: vosk.Model
-    vosk_zh: vosk.Model
-    en_zh: MTModel
-    zh_en: MTModel
-    tts: Optional[pyttsx3.Engine]
+    vosk_en:      vosk.Model
+    vosk_zh:      vosk.Model
+    en_zh:        MTModel
+    zh_en:        MTModel
+    piper_en:     object
+    piper_zh:     object
+    tts_engine:   Optional[pyttsx3.Engine]
+    tts_voice_en: Optional[str]
+    tts_voice_zh: Optional[str]
 
-
-# ======================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # Init
-# ======================================================
-
-def load_ct2_model(model_dir: str) -> MTModel:
-    require_dir(model_dir)
-    require_file(os.path.join(model_dir, "model.bin"))
-    require_file(os.path.join(model_dir, "source.spm"))
-    require_file(os.path.join(model_dir, "target.spm"))
-
-    translator = ctranslate2.Translator(
-        model_dir,
-        compute_type=CT2_COMPUTE_TYPE,
-    )
-
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_ct2(model_dir: str) -> MTModel:
+    for f in ("model.bin", "source.spm", "target.spm"):
+        p = os.path.join(model_dir, f)
+        if not os.path.isfile(p):
+            raise FileNotFoundError(p)
+    translator = ctranslate2.Translator(model_dir, compute_type=CT2_COMPUTE_TYPE)
     sp_src = spm.SentencePieceProcessor()
     sp_src.load(os.path.join(model_dir, "source.spm"))
-
     sp_tgt = spm.SentencePieceProcessor()
     sp_tgt.load(os.path.join(model_dir, "target.spm"))
-
     return MTModel(translator, sp_src, sp_tgt)
 
 
+def _load_piper_voice(onnx_path: str):
+    if not PIPER_AVAILABLE:
+        return None
+    json_path = onnx_path + ".json"
+    if not os.path.isfile(onnx_path):
+        print(f"  [Piper] voice not found: {onnx_path}")
+        return None
+    try:
+        return PiperVoice.load(
+            onnx_path,
+            config_path=json_path if os.path.isfile(json_path) else None,
+            use_cuda=False,
+        )
+    except Exception as e:
+        print(f"  [Piper] load error: {e}")
+        return None
+
+
 def init_app() -> AppState:
-    print("Loading Vosk...")
+    print("Loading Vosk EN ...")
     vosk_en = vosk.Model(VOSK_EN_DIR)
+    print("Loading Vosk ZH ...")
     vosk_zh = vosk.Model(VOSK_ZH_DIR)
+    print("Loading EN->ZH model ...")
+    en_zh = _load_ct2(CT2_EN_ZH_DIR)
+    print("Loading ZH->EN model ...")
+    zh_en = _load_ct2(CT2_ZH_EN_DIR)
 
-    print("Loading EN→ZH model...")
-    en_zh = load_ct2_model(CT2_EN_ZH_DIR)
+    piper_en = piper_zh = None
+    if PIPER_AVAILABLE:
+        print("Loading Piper EN voice ...")
+        piper_en = _load_piper_voice(VOICE_EN)
+        print("Loading Piper ZH voice ...")
+        piper_zh = _load_piper_voice(VOICE_ZH)
+        loaded = [n for n, v in [("EN", piper_en), ("ZH", piper_zh)] if v]
+        print(f"Piper voices loaded: {loaded if loaded else 'none'}")
+    else:
+        print("piper-tts not installed — run: pip install piper-tts")
 
-    print("Loading ZH→EN model...")
-    zh_en = load_ct2_model(CT2_ZH_EN_DIR)
+    tts_engine = tts_voice_en = tts_voice_zh = None
+    if ENABLE_TTS:
+        tts_engine = pyttsx3.init()
+        tts_engine.setProperty("rate", 160)
+        tts_engine.setProperty("volume", 1.0)
+        voices = tts_engine.getProperty("voices")
+        tts_voice_en = voices[0].id if voices else None
+        tts_voice_zh = next(
+            (v.id for v in voices if "zh" in v.id.lower()
+             or any(n in v.name.lower() for n in ("huihui", "yaoyao", "xiaoxiao"))),
+            None,
+        )
+        print(f"pyttsx3 fallback — EN: {bool(tts_voice_en)}  ZH: {bool(tts_voice_zh)}")
 
-    engine = pyttsx3.init() if ENABLE_TTS else None
+    print("\nReady.\n")
+    return AppState(vosk_en, vosk_zh, en_zh, zh_en,
+                    piper_en, piper_zh, tts_engine, tts_voice_en, tts_voice_zh)
 
-    print("Ready.\n")
-
-    return AppState(vosk_en, vosk_zh, en_zh, zh_en, engine)
-
-
-# ======================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # STT
-# ======================================================
-
-def transcribe_wav(model: vosk.Model, wav_path: str) -> str:
+# ─────────────────────────────────────────────────────────────────────────────
+def _transcribe_wav(model: vosk.Model, wav_path: str) -> str:
     with wave.open(wav_path, "rb") as wf:
-        rec = vosk.KaldiRecognizer(model, wf.getframerate())
+        rec   = vosk.KaldiRecognizer(model, wf.getframerate())
         parts = []
-
         while True:
             data = wf.readframes(4000)
             if not data:
                 break
             if rec.AcceptWaveform(data):
-                res = json.loads(rec.Result())
-                if res.get("text"):
-                    parts.append(res["text"])
-
+                r = json.loads(rec.Result())
+                if r.get("text"):
+                    parts.append(r["text"])
         final = json.loads(rec.FinalResult())
         if final.get("text"):
             parts.append(final["text"])
+    return " ".join(parts).strip()
 
-        return " ".join(parts).strip()
+
+def _dedup_stt(text: str) -> str:
+    words = text.split()
+    n = len(words)
+    for half in range(n // 2, 0, -1):
+        if words[:half] == words[half: half * 2]:
+            return " ".join(words[half:])
+    return text
 
 
-# ======================================================
+def record_mic(out_path: str = REC_FILE) -> str:
+    print(f"Listening ... (silence for {SILENCE_TIMEOUT:.0f}s to stop)")
+    frames       = []
+    block_size   = int(MIC_SAMPLE_RATE * MIC_BLOCK_SEC)
+    max_silent   = int(SILENCE_TIMEOUT / MIC_BLOCK_SEC)
+    max_blocks   = int(MAX_RECORD_SEC  / MIC_BLOCK_SEC)
+    silent_count = 0
+    started      = False
+
+    with sd.InputStream(samplerate=MIC_SAMPLE_RATE, channels=MIC_CHANNELS,
+                        dtype="int16", blocksize=block_size) as stream:
+        for _ in range(max_blocks):
+            block, _ = stream.read(block_size)
+            rms = float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
+            frames.append(block.copy())
+            if rms > SILENCE_RMS:
+                started = True
+                silent_count = 0
+            elif started:
+                silent_count += 1
+                if silent_count >= max_silent:
+                    break
+
+    print("Recording stopped.")
+    audio = np.concatenate(frames, axis=0)
+    with wave.open(out_path, "wb") as wf:
+        wf.setnchannels(MIC_CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(MIC_SAMPLE_RATE)
+        wf.writeframes(audio.tobytes())
+    return out_path
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Translation
-# ======================================================
+# ─────────────────────────────────────────────────────────────────────────────
+def _split_sentences(text: str) -> List[str]:
+    parts = re.split(r'(?<=[。！？；.!?;])\s*', text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _clean(text: str) -> str:
+    text = re.sub(r'([\u4e00-\u9fff\u3000-\u303f]{2,6})\1{2,}', r'\1', text)
+    return " ".join(text.split()).strip()
+
 
 def translate(mt: MTModel, text: str) -> str:
     if not text.strip():
         return ""
+    results = []
+    for sent in (_split_sentences(text) or [text]):
+        toks = mt.sp_src.encode(sent, out_type=str)
+        if mt.sp_src.piece_to_id("</s>") != mt.sp_src.unk_id():
+            toks = toks + ["</s>"]
+        res = mt.translator.translate_batch(
+            [toks],
+            beam_size=CT2_BEAM_SIZE,
+            max_decoding_length=CT2_MAX_DECODING_LEN,
+            no_repeat_ngram_size=CT2_NO_REPEAT_NGRAM,
+            repetition_penalty=CT2_REPETITION_PENALTY,
+        )
+        out = [t for t in res[0].hypotheses[0] if t not in {"</s>", "<s>", "<pad>"}]
+        results.append(mt.sp_tgt.decode(out).strip())
+    return _clean(" ".join(results))
 
-    toks = mt.sp_src.encode(text, out_type=str)
-    toks = maybe_append_eos(mt.sp_src, toks)
+# ─────────────────────────────────────────────────────────────────────────────
+# TTS
+# ─────────────────────────────────────────────────────────────────────────────
+def _piper_play(voice, text: str):
+    """
+    Try three Piper API methods in order of preference.
+    Different piper-tts versions expose different APIs.
+    """
+    # Method 1: synthesize_stream_raw (piper-tts >= 1.2, no wave file needed)
+    if hasattr(voice, "synthesize_stream_raw"):
+        rate = voice.config.sample_rate
+        stream = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+        stream.start()
+        for audio_bytes in voice.synthesize_stream_raw(text):
+            stream.write(np.frombuffer(audio_bytes, dtype=np.int16))
+        stream.stop()
+        stream.close()
+        return
 
-    result = mt.translator.translate_batch(
-        [toks],
-        beam_size=CT2_BEAM_SIZE,
-        max_decoding_length=CT2_MAX_DECODING_LEN,
-        no_repeat_ngram_size=CT2_NO_REPEAT_NGRAM,
-        repetition_penalty=CT2_REPETITION_PENALTY,
-    )
+    # Method 2: synthesize_wav (newer piper1-gpl fork)
+    if hasattr(voice, "synthesize_wav"):
+        out_wav = os.path.join(DATA_DIR, "tts_out.wav")
+        with wave.open(out_wav, "wb") as wf:
+            voice.synthesize_wav(text, wf)
+        with wave.open(out_wav, "rb") as wf:
+            rate = wf.getframerate()
+            data = wf.readframes(wf.getnframes())
+        audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+        sd.play(audio, samplerate=rate)
+        sd.wait()
+        return
 
-    out_tokens = strip_special(result[0].hypotheses[0])
-    return mt.sp_tgt.decode(out_tokens).strip()
+    # Method 3: synthesize() with a pre-configured wave file
+    # Must set nchannels/sampwidth/framerate BEFORE calling synthesize()
+    if hasattr(voice, "synthesize"):
+        out_wav = os.path.join(DATA_DIR, "tts_out.wav")
+        rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
+        with wave.open(out_wav, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)   # 16-bit
+            wf.setframerate(rate)
+            voice.synthesize(text, wf)
+        with wave.open(out_wav, "rb") as wf:
+            data = wf.readframes(wf.getnframes())
+        audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+        sd.play(audio, samplerate=rate)
+        sd.wait()
+        return
+
+    raise RuntimeError("No supported synthesize method found on PiperVoice object.")
 
 
-def speak(engine, text):
-    if engine and text:
-        engine.say(text)
-        engine.runAndWait()
+def speak(app: AppState, text: str, lang: str):
+    """lang: 'en' or 'zh'. Piper first, pyttsx3 fallback."""
+    if not ENABLE_TTS or not text:
+        return
 
+    voice = app.piper_zh if lang == "zh" else app.piper_en
+    if voice:
+        try:
+            _piper_play(voice, text)
+            return
+        except Exception as e:
+            print(f"  [TTS] Piper error: {e} — falling back to pyttsx3")
 
-# ======================================================
+    if not app.tts_engine:
+        print("  [TTS] No TTS available.")
+        return
+    vid = app.tts_voice_zh if (lang == "zh" and app.tts_voice_zh) else app.tts_voice_en
+    if vid:
+        app.tts_engine.setProperty("voice", vid)
+    app.tts_engine.say(text)
+    app.tts_engine.runAndWait()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
-# ======================================================
-
-# ======================================================
-# CLI
-# ======================================================
-
+# ─────────────────────────────────────────────────────────────────────────────
 def run_typed(app: AppState):
-    direction = input("1=EN→ZH, 2=ZH→EN: ").strip()
+    en_to_zh = input("Direction — 1=EN->ZH  2=ZH->EN: ").strip() != "2"
+    mt, label, tgt = (app.en_zh, "EN->ZH", "zh") if en_to_zh else (app.zh_en, "ZH->EN", "en")
     text = input("Text: ").strip()
-
-    mt = app.en_zh if direction != "2" else app.zh_en
-    label = "EN→ZH" if direction != "2" else "ZH→EN"
-
-    t0 = time.time()
-    out = translate(mt, text)
-
-    print(f"\n[{label}] {text}")
-    print("→", out)
-    print(f"[time] {time.time()-t0:.3f}s")
-
-    speak(app.tts, out)
+    t0   = time.time()
+    out  = translate(mt, text)
+    print(f"\n[{label}] {text}\n->  {out}\n[{time.time()-t0:.2f}s]\n")
+    speak(app, out, tgt)
 
 
 def run_wav(app: AppState):
-    lang = input("1=English speech, 2=Chinese speech: ").strip()
-
-    if lang != "2":
-        vosk_model = app.vosk_en
-        mt = app.en_zh
-        label = "EN→ZH"
-    else:
-        vosk_model = app.vosk_zh
-        mt = app.zh_en
-        label = "ZH→EN"
-
-    text = transcribe_wav(vosk_model, REC_FILE)
-    print("Recognized:", text)
-
+    en_input = input("Speech language — 1=English  2=Chinese: ").strip() != "2"
+    vosk_model, mt, label, tgt = (
+        (app.vosk_en, app.en_zh, "EN->ZH", "zh") if en_input
+        else (app.vosk_zh, app.zh_en, "ZH->EN", "en")
+    )
+    text = _transcribe_wav(vosk_model, REC_FILE)
+    print(f"Recognised: {text}")
     if not text:
         return
-
-    t0 = time.time()
+    t0  = time.time()
     out = translate(mt, text)
-
-    print(f"\n[{label}] {text}")
-    print("→", out)
-    print(f"[time] {time.time()-t0:.3f}s")
-
-    speak(app.tts, out)
+    print(f"\n[{label}] {text}\n->  {out}\n[{time.time()-t0:.2f}s]\n")
+    speak(app, out, tgt)
 
 
-# ======================================================
-# Quick Test Samples (Option 3)
-# ======================================================
+def run_live_mic(app: AppState):
+    en_input = input("Speak in — 1=English  2=Chinese: ").strip() != "2"
+    vosk_model, mt, label, tgt = (
+        (app.vosk_en, app.en_zh, "EN->ZH", "zh") if en_input
+        else (app.vosk_zh, app.zh_en, "ZH->EN", "en")
+    )
+    wav_path = record_mic()
+    t0   = time.time()
+    raw  = _transcribe_wav(vosk_model, wav_path)
+    text = _dedup_stt(raw)
+    print(f"Recognised: {text}" + (f"  (raw: {raw})" if raw != text else ""))
+    if not text:
+        print("Nothing recognised — try speaking louder.")
+        return
+    t1  = time.time()
+    out = translate(mt, text)
+    print(f"[{label}] {text}\n->  {out}")
+    print(f"[translate {time.time()-t1:.2f}s | total {time.time()-t0:.2f}s]\n")
+    speak(app, out, tgt)
+
 
 def run_samples(app: AppState):
     samples = [
-        ("EN→ZH", "I am allergic to peanuts."),
-        ("EN→ZH", "Where is the nearest bathroom?"),
-        ("EN→ZH", "Please speak slowly."),
-        ("ZH→EN", "你好，我想点一杯咖啡。"),
-        ("ZH→EN", "请问最近的地铁站在哪里？"),
+        ("EN->ZH", "I am allergic to peanuts."),
+        ("EN->ZH", "Where is the nearest bathroom?"),
+        ("EN->ZH", "Please call an ambulance."),
+        ("ZH->EN", "你好，我想点一杯咖啡。"),
+        ("ZH->EN", "请问最近的地铁站在哪里？"),
+        ("ZH->EN", "我对花生过敏，请不要放花生。"),
     ]
-
     for label, text in samples:
-        mt = app.en_zh if label == "EN→ZH" else app.zh_en
-
-        t0 = time.time()
+        en_to_zh = label == "EN->ZH"
+        mt  = app.en_zh if en_to_zh else app.zh_en
+        tgt = "zh"      if en_to_zh else "en"
+        t0  = time.time()
         out = translate(mt, text)
-        dt = time.time() - t0
-
-        print(f"\n[{label}] {text}")
-        print("→", out)
-        print(f"[time] {dt:.3f}s")
-
-        speak(app.tts, out)
+        print(f"\n[{label}] {text}\n->  {out}  [{time.time()-t0:.2f}s]")
+        speak(app, out, tgt)
 
 
 def main():
     app = init_app()
-
     while True:
-        print("\n==============================")
-        print("PC Translator Test (dual model)")
-        print("==============================")
-        print("1) Type text → Translate → Speak")
-        print("2) WAV file → STT → Translate → Speak")
-        print("3) Quick test samples")
-        print("0) Quit")
-
+        print("══════════════════════════════")
+        print("  PC Translator  (EN <-> ZH) ")
+        print("══════════════════════════════")
+        print("  1) Type text  -> translate -> speak")
+        print("  2) WAV file   -> STT -> translate -> speak")
+        print("  3) Quick test samples")
+        print("  4) Live mic   -> STT -> translate -> speak")
+        print("  0) Quit")
+        print("══════════════════════════════")
         c = input("Choose: ").strip()
-
-        if c == "0":
-            break
-        elif c == "1":
-            run_typed(app)
-        elif c == "2":
-            run_wav(app)
-        elif c == "3":
-            run_samples(app)
-        else:
-            print("Invalid choice.")
-
+        if   c == "0": break
+        elif c == "1": run_typed(app)
+        elif c == "2": run_wav(app)
+        elif c == "3": run_samples(app)
+        elif c == "4": run_live_mic(app)
+        else:          print("Invalid choice.")
 
 if __name__ == "__main__":
     main()
