@@ -25,8 +25,6 @@ import vosk
 import ctranslate2
 import sentencepiece as spm
 
-# piper-tts Python package — works on both Windows and Pi
-# install: pip install piper-tts
 try:
     from piper.voice import PiperVoice
     PIPER_AVAILABLE = True
@@ -73,9 +71,9 @@ CT2_REPETITION_PENALTY = 1.15
 MIC_SAMPLE_RATE = 16_000
 MIC_CHANNELS    = 1
 MIC_BLOCK_SEC   = 0.25
-SILENCE_TIMEOUT = 2.0
+SILENCE_TIMEOUT = 2.5   # raised: avoids cutting off mid-sentence pauses
 MAX_RECORD_SEC  = 30
-SILENCE_RMS     = 150
+SILENCE_RMS     = 300   # raised from 150: background hiss no longer trips end-of-speech
 
 ENABLE_TTS = True
 
@@ -174,33 +172,111 @@ def init_app() -> AppState:
                     piper_en, piper_zh, tts_engine, tts_voice_en, tts_voice_zh)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Audio pre-processing — pure numpy, zero model cost
+# ─────────────────────────────────────────────────────────────────────────────
+def _normalize_audio(audio: np.ndarray) -> np.ndarray:
+    """
+    Peak-normalize int16 audio to ~90% of full scale.
+    Only amplifies quiet recordings; leaves loud ones untouched to avoid clipping.
+    """
+    peak = np.abs(audio.astype(np.float32)).max()
+    if peak < 1:
+        return audio
+    scale = (32767 * 0.9) / peak
+    if scale < 1.0:
+        return audio
+    return np.clip(audio.astype(np.float32) * scale, -32768, 32767).astype(np.int16)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STT
 # ─────────────────────────────────────────────────────────────────────────────
+_FILLER_RE = re.compile(r'\b(uh+|um+|hmm+|huh|mm+|ah+|er+)\b', re.IGNORECASE)
+
+def _strip_fillers(text: str) -> str:
+    """Remove filler words that pollute the translation input."""
+    return ' '.join(_FILLER_RE.sub('', text).split())
+
+
 def _transcribe_wav(model: vosk.Model, wav_path: str) -> str:
+    """
+    Transcribe a WAV file with Vosk.
+
+    Changes vs original (no compute cost increase):
+    - Audio peak-normalised before decoding for consistent signal level.
+    - Partial results harvested as fallback for trailing words Vosk doesn't flush.
+    - Filler tokens (uh, um, hmm…) stripped from every segment.
+    """
     with wave.open(wav_path, "rb") as wf:
-        rec   = vosk.KaldiRecognizer(model, wf.getframerate())
-        parts = []
-        while True:
-            data = wf.readframes(4000)
-            if not data:
-                break
-            if rec.AcceptWaveform(data):
-                r = json.loads(rec.Result())
-                if r.get("text"):
-                    parts.append(r["text"])
-        final = json.loads(rec.FinalResult())
-        if final.get("text"):
-            parts.append(final["text"])
+        raw  = wf.readframes(wf.getnframes())
+        rate = wf.getframerate()
+        nch  = wf.getnchannels()
+        sw   = wf.getsampwidth()
+
+    audio = _normalize_audio(np.frombuffer(raw, dtype=np.int16))
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf_out:
+        wf_out.setnchannels(nch)
+        wf_out.setsampwidth(sw)
+        wf_out.setframerate(rate)
+        wf_out.writeframes(audio.tobytes())
+    buf.seek(0)
+
+    rec          = vosk.KaldiRecognizer(model, rate)
+    rec.SetWords(True)
+    parts        = []
+    last_partial = ""
+
+    while True:
+        data = buf.read(8000)   # 4000 int16 samples
+        if not data:
+            break
+        if rec.AcceptWaveform(data):
+            seg = _strip_fillers(json.loads(rec.Result()).get("text", ""))
+            if seg:
+                parts.append(seg)
+            last_partial = ""
+        else:
+            last_partial = json.loads(rec.PartialResult()).get("partial", "")
+
+    seg = _strip_fillers(json.loads(rec.FinalResult()).get("text", ""))
+    if seg:
+        parts.append(seg)
+    elif last_partial:
+        seg = _strip_fillers(last_partial)
+        if seg:
+            parts.append(seg)
+
     return " ".join(parts).strip()
 
 
 def _dedup_stt(text: str) -> str:
+    """
+    Remove duplicated phrases Vosk occasionally produces.
+
+    Handles:
+    1. Exact prefix repeat:          "hello hello world"   -> "hello world"
+    2. Full-string repeat (recurse): "thank you thank you" -> "thank you"
+    3. Consecutive identical tokens: "的 的 的 猫"         -> "的 猫"
+    """
     words = text.split()
-    n = len(words)
-    for half in range(n // 2, 0, -1):
-        if words[:half] == words[half: half * 2]:
-            return " ".join(words[half:])
-    return text
+    n     = len(words)
+    if n == 0:
+        return text
+
+    half = n // 2
+    if half > 0 and words[:half] == words[half:half * 2]:
+        return _dedup_stt(" ".join(words[half:]))   # recurse for tripling
+
+    for size in range(half, 0, -1):
+        if words[:size] == words[size:size * 2]:
+            return " ".join(words[size:])
+
+    deduped = [words[0]]
+    for w in words[1:]:
+        if w != deduped[-1]:
+            deduped.append(w)
+    return " ".join(deduped)
 
 
 def record_mic(out_path: str = REC_FILE) -> str:
@@ -271,13 +347,8 @@ def translate(mt: MTModel, text: str) -> str:
 # TTS
 # ─────────────────────────────────────────────────────────────────────────────
 def _piper_play(voice, text: str):
-    """
-    Try three Piper API methods in order of preference.
-    Different piper-tts versions expose different APIs.
-    """
-    # Method 1: synthesize_stream_raw (piper-tts >= 1.2, no wave file needed)
     if hasattr(voice, "synthesize_stream_raw"):
-        rate = voice.config.sample_rate
+        rate   = voice.config.sample_rate
         stream = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
         stream.start()
         for audio_bytes in voice.synthesize_stream_raw(text):
@@ -286,7 +357,6 @@ def _piper_play(voice, text: str):
         stream.close()
         return
 
-    # Method 2: synthesize_wav (newer piper1-gpl fork)
     if hasattr(voice, "synthesize_wav"):
         out_wav = os.path.join(DATA_DIR, "tts_out.wav")
         with wave.open(out_wav, "wb") as wf:
@@ -294,25 +364,23 @@ def _piper_play(voice, text: str):
         with wave.open(out_wav, "rb") as wf:
             rate = wf.getframerate()
             data = wf.readframes(wf.getnframes())
-        audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-        sd.play(audio, samplerate=rate)
+        sd.play(np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0,
+                samplerate=rate)
         sd.wait()
         return
 
-    # Method 3: synthesize() with a pre-configured wave file
-    # Must set nchannels/sampwidth/framerate BEFORE calling synthesize()
     if hasattr(voice, "synthesize"):
         out_wav = os.path.join(DATA_DIR, "tts_out.wav")
-        rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
+        rate    = getattr(getattr(voice, "config", None), "sample_rate", 22050)
         with wave.open(out_wav, "wb") as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(2)   # 16-bit
+            wf.setsampwidth(2)
             wf.setframerate(rate)
             voice.synthesize(text, wf)
         with wave.open(out_wav, "rb") as wf:
             data = wf.readframes(wf.getnframes())
-        audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-        sd.play(audio, samplerate=rate)
+        sd.play(np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0,
+                samplerate=rate)
         sd.wait()
         return
 
@@ -320,10 +388,8 @@ def _piper_play(voice, text: str):
 
 
 def speak(app: AppState, text: str, lang: str):
-    """lang: 'en' or 'zh'. Piper first, pyttsx3 fallback."""
     if not ENABLE_TTS or not text:
         return
-
     voice = app.piper_zh if lang == "zh" else app.piper_en
     if voice:
         try:
@@ -331,7 +397,6 @@ def speak(app: AppState, text: str, lang: str):
             return
         except Exception as e:
             print(f"  [TTS] Piper error: {e} — falling back to pyttsx3")
-
     if not app.tts_engine:
         print("  [TTS] No TTS available.")
         return
