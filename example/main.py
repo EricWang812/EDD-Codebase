@@ -2,10 +2,13 @@
 WhisPlay HAT Translator — EN <-> ZH
 Vosk STT  +  CTranslate2 OPUS MT  +  Piper TTS
 
-Hardware: WhisPlay HAT (Raspberry Pi)
-  - Button: short press = start in Chinese first, long press = start in English first
-  - Next press after speech = stop recording → translate → speak → wait for next
+Hardware: WhisPlay HAT (Raspberry Pi Zero 2W)
+  - Button: short press = start ZH first, long press = start EN first
+  - Next press after speech = stop recording → translate → speak → next turn
   - 15s silence timeout = auto-stop conversation, return to IDLE
+
+LAZY LOADING: Models are loaded on-demand and unloaded after use to fit
+within the Pi Zero 2W's 512MB RAM limit.
 
 Install deps:
     pip install vosk ctranslate2 sentencepiece sounddevice numpy piper-tts
@@ -14,14 +17,16 @@ Install deps:
 
 from __future__ import annotations
 
+import gc
 import io
 import json
 import os
 import re
 import sys
 import time
+import threading
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from time import sleep
 from typing import List, Optional
@@ -47,13 +52,15 @@ except ImportError:
     WHISPLAY_AVAILABLE = False
     print("[WARN] WhisPlay driver not found — running in headless mode")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # State Machine
 # ─────────────────────────────────────────────────────────────────────────────
 class State(Enum):
-    IDLE       = 0   # waiting for button press
-    LISTENING  = 1   # recording mic input
-    PROCESSING = 2   # translating + speaking
+    IDLE       = 0
+    LISTENING  = 1
+    PROCESSING = 2
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Paths
@@ -73,6 +80,7 @@ CT2_ZH_EN_DIR = os.path.join(MODELS_DIR, "opus-zh-en-ct2")
 VOICE_EN      = os.path.join(VOICES_DIR, "en_US-lessac-low.onnx")
 VOICE_ZH      = os.path.join(VOICES_DIR, "zh_CN-huayan-x_low.onnx")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Settings
 # ─────────────────────────────────────────────────────────────────────────────
@@ -81,19 +89,22 @@ CT2_BEAM_SIZE          = 2
 CT2_MAX_DECODING_LEN   = 256
 CT2_NO_REPEAT_NGRAM    = 3
 CT2_REPETITION_PENALTY = 1.15
+CT2_INTER_THREADS      = 1
+CT2_INTRA_THREADS      = 2
 
 MIC_SAMPLE_RATE  = 16_000
 MIC_CHANNELS     = 1
 MIC_BLOCK_SEC    = 0.25
-SILENCE_RMS      = 300
 
-HOLD_DURATION    = 1.0   # seconds — long press threshold
-CONVO_TIMEOUT    = 15.0  # seconds — inactivity → back to IDLE
+HOLD_DURATION    = 1.0    # seconds — long press threshold
+CONVO_TIMEOUT    = 15.0   # seconds — inactivity → back to IDLE
+MAX_RECORD_SEC   = 30
 
 ENABLE_TTS = True
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Data classes
+# Lazy model cache — only one MT model in memory at a time
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class MTModel:
@@ -101,24 +112,92 @@ class MTModel:
     sp_src:     spm.SentencePieceProcessor
     sp_tgt:     spm.SentencePieceProcessor
 
-@dataclass
-class AppState:
-    vosk_en:  vosk.Model
-    vosk_zh:  vosk.Model
-    en_zh:    MTModel
-    zh_en:    MTModel
-    piper_en: object
-    piper_zh: object
+
+class LazyModelCache:
+    """
+    Keeps at most one Vosk model and one MT model loaded at a time.
+    Automatically unloads the previous model before loading a new one
+    to stay within the Pi Zero 2W's 512 MB RAM.
+    """
+
+    def __init__(self):
+        self._vosk_key:  Optional[str]     = None
+        self._vosk:      Optional[vosk.Model] = None
+        self._mt_key:    Optional[str]     = None
+        self._mt:        Optional[MTModel] = None
+        self._piper_key: Optional[str]     = None
+        self._piper                        = None
+
+    # ── Vosk ──────────────────────────────────────────────────────────────────
+    def get_vosk(self, model_dir: str) -> vosk.Model:
+        if self._vosk_key == model_dir:
+            return self._vosk
+        print(f"  [Cache] Unloading Vosk, loading: {os.path.basename(model_dir)}")
+        self._vosk = None
+        gc.collect()
+        self._vosk = vosk.Model(model_dir)
+        self._vosk_key = model_dir
+        return self._vosk
+
+    # ── MT ────────────────────────────────────────────────────────────────────
+    def get_mt(self, model_dir: str) -> MTModel:
+        if self._mt_key == model_dir:
+            return self._mt
+        print(f"  [Cache] Unloading MT, loading: {os.path.basename(model_dir)}")
+        self._mt = None
+        gc.collect()
+        self._mt = _load_ct2(model_dir)
+        self._mt_key = model_dir
+        return self._mt
+
+    # ── Piper ─────────────────────────────────────────────────────────────────
+    def get_piper(self, onnx_path: str):
+        if not PIPER_AVAILABLE or not os.path.isfile(onnx_path):
+            return None
+        if self._piper_key == onnx_path:
+            return self._piper
+        print(f"  [Cache] Unloading Piper, loading: {os.path.basename(onnx_path)}")
+        self._piper = None
+        gc.collect()
+        json_path = onnx_path + ".json"
+        try:
+            self._piper = PiperVoice.load(
+                onnx_path,
+                config_path=json_path if os.path.isfile(json_path) else None,
+                use_cuda=False,
+            )
+            self._piper_key = onnx_path
+        except Exception as e:
+            print(f"  [Piper] load error: {e}")
+            self._piper = None
+            self._piper_key = None
+        return self._piper
+
+    def unload_all(self):
+        self._vosk = self._mt = self._piper = None
+        self._vosk_key = self._mt_key = self._piper_key = None
+        gc.collect()
+
+
+# Global cache instance
+_cache = LazyModelCache()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model loading
+# Model loading helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_ct2(model_dir: str) -> MTModel:
     for f in ("model.bin", "source.spm", "target.spm"):
         p = os.path.join(model_dir, f)
         if not os.path.isfile(p):
             raise FileNotFoundError(p)
-    translator = ctranslate2.Translator(model_dir, compute_type=CT2_COMPUTE_TYPE)
+    translator = ctranslate2.Translator(
+        model_dir,
+        compute_type=CT2_COMPUTE_TYPE,
+        inter_threads=CT2_INTER_THREADS,
+        intra_threads=CT2_INTRA_THREADS,
+        max_queued_batches=1,
+    )
     sp_src = spm.SentencePieceProcessor()
     sp_src.load(os.path.join(model_dir, "source.spm"))
     sp_tgt = spm.SentencePieceProcessor()
@@ -126,51 +205,10 @@ def _load_ct2(model_dir: str) -> MTModel:
     return MTModel(translator, sp_src, sp_tgt)
 
 
-def _load_piper_voice(onnx_path: str):
-    if not PIPER_AVAILABLE:
-        return None
-    json_path = onnx_path + ".json"
-    if not os.path.isfile(onnx_path):
-        print(f"  [Piper] voice not found: {onnx_path}")
-        return None
-    try:
-        return PiperVoice.load(
-            onnx_path,
-            config_path=json_path if os.path.isfile(json_path) else None,
-            use_cuda=False,
-        )
-    except Exception as e:
-        print(f"  [Piper] load error: {e}")
-        return None
-
-
-def init_app() -> AppState:
-    print("Loading Vosk EN ...")
-    vosk_en = vosk.Model(VOSK_EN_DIR)
-    print("Loading Vosk ZH ...")
-    vosk_zh = vosk.Model(VOSK_ZH_DIR)
-    print("Loading EN->ZH model ...")
-    en_zh = _load_ct2(CT2_EN_ZH_DIR)
-    print("Loading ZH->EN model ...")
-    zh_en = _load_ct2(CT2_ZH_EN_DIR)
-
-    piper_en = piper_zh = None
-    if PIPER_AVAILABLE:
-        print("Loading Piper EN voice ...")
-        piper_en = _load_piper_voice(VOICE_EN)
-        print("Loading Piper ZH voice ...")
-        piper_zh = _load_piper_voice(VOICE_ZH)
-        loaded = [n for n, v in [("EN", piper_en), ("ZH", piper_zh)] if v]
-        print(f"Piper voices loaded: {loaded if loaded else 'none'}")
-
-    print("\nReady.\n")
-    return AppState(vosk_en, vosk_zh, en_zh, zh_en, piper_en, piper_zh)
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Display helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_image(board, filepath: str):
-    """Load a JPEG as RGB565 for the WhisPlay LCD."""
     try:
         from PIL import Image
         img = Image.open(filepath).convert("RGB")
@@ -188,16 +226,16 @@ def _load_image(board, filepath: str):
 
 
 def update_display(board, state: State, images: dict):
-    """Push the correct image to the LCD for the current state."""
     if board is None:
         return
-    key = state.name.lower()   # "idle" / "listening" / "processing"
+    key = state.name.lower()
     img = images.get(key)
     if img:
         board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Audio pre-processing
+# Audio helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _normalize_audio(audio: np.ndarray) -> np.ndarray:
     peak = np.abs(audio.astype(np.float32)).max()
@@ -208,21 +246,16 @@ def _normalize_audio(audio: np.ndarray) -> np.ndarray:
         return audio
     return np.clip(audio.astype(np.float32) * scale, -32768, 32767).astype(np.int16)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Recording — mic via sounddevice (works on Pi with ALSA/PulseAudio)
+# Recording
 # ─────────────────────────────────────────────────────────────────────────────
-def record_until_button(stop_event) -> str:
-    """
-    Record from mic into REC_FILE.
-    Stops when stop_event is set (button pressed) OR after MAX_RECORD_SEC.
-    Returns path to WAV file.
-    """
-    MAX_RECORD_SEC = 30
+def record_until_button(stop_event: threading.Event) -> str:
     block_size = int(MIC_SAMPLE_RATE * MIC_BLOCK_SEC)
     max_blocks = int(MAX_RECORD_SEC / MIC_BLOCK_SEC)
     frames = []
 
-    print(f"  [MIC] Recording — press button to stop ...")
+    print("  [MIC] Recording — press button to stop ...")
     with sd.InputStream(samplerate=MIC_SAMPLE_RATE, channels=MIC_CHANNELS,
                         dtype="int16", blocksize=block_size) as stream:
         for _ in range(max_blocks):
@@ -240,10 +273,12 @@ def record_until_button(stop_event) -> str:
         wf.writeframes(audio.tobytes())
     return REC_FILE
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STT
 # ─────────────────────────────────────────────────────────────────────────────
 _FILLER_RE = re.compile(r'\b(uh+|um+|hmm+|huh|mm+|ah+|er+)\b', re.IGNORECASE)
+
 
 def _strip_fillers(text: str) -> str:
     return ' '.join(_FILLER_RE.sub('', text).split())
@@ -311,6 +346,7 @@ def _dedup_stt(text: str) -> str:
             deduped.append(w)
     return " ".join(deduped)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Translation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,6 +378,7 @@ def translate(mt: MTModel, text: str) -> str:
         out = [t for t in res[0].hypotheses[0] if t not in {"</s>", "<s>", "<pad>"}]
         results.append(mt.sp_tgt.decode(out).strip())
     return _clean(" ".join(results))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TTS
@@ -375,10 +412,12 @@ def _piper_play(voice, text: str):
     raise RuntimeError("No supported synthesize method on PiperVoice.")
 
 
-def speak(app: AppState, text: str, lang: str):
+def speak(text: str, lang: str):
+    """Lazy-load the TTS voice needed, unloading the other to save RAM."""
     if not ENABLE_TTS or not text:
         return
-    voice = app.piper_zh if lang == "zh" else app.piper_en
+    onnx_path = VOICE_ZH if lang == "zh" else VOICE_EN
+    voice = _cache.get_piper(onnx_path)
     if voice:
         try:
             _piper_play(voice, text)
@@ -387,27 +426,11 @@ def speak(app: AppState, text: str, lang: str):
             print(f"  [TTS] Piper error: {e}")
     print(f"  [TTS] No TTS available for lang={lang}")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Main conversation loop with WhisPlay button state machine
-#
-# STATE FLOW:
-#   IDLE
-#     └─ long press  (≥1s) → eng_to_cn=True  (EN first) → LISTENING
-#     └─ short press (<1s) → eng_to_cn=False (ZH first) → LISTENING
-#
-#   LISTENING  (recording mic)
-#     └─ button press → stop recording → PROCESSING
-#     └─ 15s timeout  → stop recording → IDLE
-#
-#   PROCESSING
-#     └─ STT → translate → speak → LISTENING (for next speaker, swapped dir)
-#     └─ if empty result → LISTENING again (same direction)
+# Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    import threading
-
-    app = init_app()
-
     # ── Board init ────────────────────────────────────────────────────────────
     board = None
     images = {}
@@ -419,11 +442,11 @@ def main():
         images["processing"] = _load_image(board, os.path.join(IMGS_DIR, "playing.jpg"))
 
     # ── Shared state ──────────────────────────────────────────────────────────
-    state            = State.IDLE
-    eng_to_cn        = True        # current conversation direction
-    press_time       = 0.0
-    last_activity    = 0.0
-    stop_recording   = threading.Event()   # signals recording thread to stop
+    state          = State.IDLE
+    eng_to_cn      = True
+    press_time     = 0.0
+    last_activity  = 0.0
+    stop_recording = threading.Event()
 
     def set_state(new_state: State):
         nonlocal state
@@ -442,47 +465,38 @@ def main():
         press_time = time.time()
 
     def on_release():
-        nonlocal eng_to_cn, last_activity, stop_recording
+        nonlocal eng_to_cn, last_activity
 
         duration = time.time() - press_time
 
-        # ── IDLE → start conversation ─────────────────────────────────────
         if state == State.IDLE:
-            if duration >= HOLD_DURATION:
-                eng_to_cn = True
-                print("[BTN] Long press → starting EN→ZH")
-            else:
-                eng_to_cn = False
-                print("[BTN] Short press → starting ZH→EN")
-
+            eng_to_cn = duration >= HOLD_DURATION
+            direction = "EN→ZH" if eng_to_cn else "ZH→EN"
+            print(f"[BTN] {'Long' if eng_to_cn else 'Short'} press → starting {direction}")
             last_activity = time.time()
             stop_recording.clear()
             set_state(State.LISTENING)
-
-            # Start recording in background thread
             threading.Thread(target=_recording_thread, daemon=True).start()
-            return
 
-        # ── LISTENING → stop recording, process ──────────────────────────
-        if state == State.LISTENING:
+        elif state == State.LISTENING:
             print("[BTN] Press → stopping recording")
             stop_recording.set()
-            # processing happens inside _recording_thread after it unblocks
 
     # ── Recording + processing thread ────────────────────────────────────────
     def _recording_thread():
-        nonlocal eng_to_cn, last_activity, stop_recording
+        nonlocal eng_to_cn, last_activity
 
-        # Record until button press or max time
         record_until_button(stop_recording)
-
-        # Now process
         set_state(State.PROCESSING)
 
-        vosk_model = app.vosk_en if eng_to_cn else app.vosk_zh
-        mt         = app.en_zh   if eng_to_cn else app.zh_en
-        tgt_lang   = "zh"        if eng_to_cn else "en"
-        direction  = "EN->ZH"    if eng_to_cn else "ZH->EN"
+        vosk_dir  = VOSK_EN_DIR   if eng_to_cn else VOSK_ZH_DIR
+        mt_dir    = CT2_EN_ZH_DIR if eng_to_cn else CT2_ZH_EN_DIR
+        tgt_lang  = "zh"          if eng_to_cn else "en"
+        direction = "EN->ZH"      if eng_to_cn else "ZH->EN"
+
+        # Lazy load — only one model in RAM at a time
+        print(f"  [Load] Vosk {direction.split('->')[0]} ...")
+        vosk_model = _cache.get_vosk(vosk_dir)
 
         raw  = _transcribe_wav(vosk_model, REC_FILE)
         text = _dedup_stt(raw)
@@ -496,17 +510,16 @@ def main():
             threading.Thread(target=_recording_thread, daemon=True).start()
             return
 
+        print(f"  [Load] MT model {direction} ...")
+        mt  = _cache.get_mt(mt_dir)
         t0  = time.time()
         out = translate(mt, text)
         print(f"  [{direction}] {text}\n  ->  {out}  [{time.time()-t0:.2f}s]")
 
-        speak(app, out, tgt_lang)
+        speak(out, tgt_lang)
 
-        # Swap direction for next speaker
         eng_to_cn = not eng_to_cn
         last_activity = time.time()
-
-        # Ready for the other person to speak
         stop_recording.clear()
         set_state(State.LISTENING)
         threading.Thread(target=_recording_thread, daemon=True).start()
@@ -516,10 +529,10 @@ def main():
         board.on_button_press(on_press)
         board.on_button_release(on_release)
 
-    # ── Initial display ───────────────────────────────────────────────────────
     set_state(State.IDLE)
-    print("Button: LONG press = start speaking English first")
-    print("        SHORT press = start speaking Chinese first")
+    print("Button: LONG press  = start speaking English first (EN→ZH)")
+    print("        SHORT press = start speaking Chinese first (ZH→EN)")
+    print()
 
     # ── Main loop — timeout watchdog ─────────────────────────────────────────
     try:
@@ -527,15 +540,16 @@ def main():
             if state != State.IDLE:
                 if time.time() - last_activity > CONVO_TIMEOUT:
                     print("\n[TIMEOUT] 15s inactivity — returning to IDLE.")
-                    stop_recording.set()   # stop any ongoing recording
-                    sleep(0.5)             # let thread wind down
+                    stop_recording.set()
+                    sleep(0.5)
+                    _cache.unload_all()
                     set_state(State.IDLE)
-
             sleep(0.1)
 
     except KeyboardInterrupt:
         print("\nExiting ...")
         stop_recording.set()
+        _cache.unload_all()
         if board:
             board.cleanup()
 
