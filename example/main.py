@@ -45,7 +45,7 @@ except ImportError:
     print("[WARN] piper-tts not installed — run: pip install piper-tts")
 
 try:
-    sys.path.append(os.path.abspath("../Driver"))
+    sys.path.append("/home/teamnfg/EDD-Codebase/Driver")
     from WhisPlay import WhisPlayBoard
     WHISPLAY_AVAILABLE = True
 except ImportError:
@@ -525,9 +525,9 @@ def main():
         threading.Thread(target=_recording_thread, daemon=True).start()
 
     # ── Register button callbacks ─────────────────────────────────────────────
-    if board:
-        board.on_button_press(on_press)
-        board.on_button_release(on_release)
+    
+    board.on_button_press(on_press)
+    board.on_button_release(on_release)
 
     set_state(State.IDLE)
     print("Button: LONG press  = start speaking English first (EN→ZH)")
