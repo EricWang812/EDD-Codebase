@@ -3,12 +3,12 @@ WhisPlay HAT Translator — EN <-> ZH
 Vosk STT  +  CTranslate2 OPUS MT  +  Piper TTS
 
 Hardware: WhisPlay HAT (Raspberry Pi Zero 2W)
-  - Button: short press = start ZH first, long press = start EN first
-  - Next press after speech = stop recording → translate → speak → next turn
-  - 15s silence timeout = auto-stop conversation, return to IDLE
+  - SHORT press while IDLE  = start ZH->EN
+  - LONG press  while IDLE  = start EN->ZH  (hold >= 1s)
+  - Any press while LISTENING = stop recording -> translate -> speak -> next turn
+  - 15s inactivity timeout = return to IDLE
 
-LAZY LOADING: Models are loaded on-demand and unloaded after use to fit
-within the Pi Zero 2W's 512MB RAM limit.
+LAZY LOADING: Only one Vosk + one MT model in RAM at a time (fits 512MB).
 
 Install deps:
     pip install vosk ctranslate2 sentencepiece sounddevice numpy piper-tts
@@ -26,7 +26,6 @@ import sys
 import time
 import threading
 import wave
-from dataclasses import dataclass, field
 from enum import Enum
 from time import sleep
 from typing import List, Optional
@@ -48,9 +47,9 @@ try:
     sys.path.append("/home/teamnfg/EDD-Codebase/Driver")
     from WhisPlay import WhisPlayBoard
     WHISPLAY_AVAILABLE = True
-except ImportError:
+except Exception as e:
     WHISPLAY_AVAILABLE = False
-    print("[WARN] WhisPlay driver not found — running in headless mode")
+    print(f"[WARN] WhisPlay driver not available: {e} — running in headless mode")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,66 +96,50 @@ MIC_CHANNELS     = 1
 MIC_BLOCK_SEC    = 0.25
 
 HOLD_DURATION    = 1.0    # seconds — long press threshold
-CONVO_TIMEOUT    = 15.0   # seconds — inactivity → back to IDLE
+CONVO_TIMEOUT    = 15.0   # seconds — inactivity -> back to IDLE
 MAX_RECORD_SEC   = 30
 
 ENABLE_TTS = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lazy model cache — only one MT model in memory at a time
+# Lazy model cache — only one model of each type in RAM at a time
 # ─────────────────────────────────────────────────────────────────────────────
-@dataclass
-class MTModel:
-    translator: ctranslate2.Translator
-    sp_src:     spm.SentencePieceProcessor
-    sp_tgt:     spm.SentencePieceProcessor
-
-
 class LazyModelCache:
-    """
-    Keeps at most one Vosk model and one MT model loaded at a time.
-    Automatically unloads the previous model before loading a new one
-    to stay within the Pi Zero 2W's 512 MB RAM.
-    """
-
     def __init__(self):
-        self._vosk_key:  Optional[str]     = None
-        self._vosk:      Optional[vosk.Model] = None
-        self._mt_key:    Optional[str]     = None
-        self._mt:        Optional[MTModel] = None
-        self._piper_key: Optional[str]     = None
-        self._piper                        = None
+        self._vosk_key  = None
+        self._vosk      = None
+        self._mt_key    = None
+        self._mt        = None
+        self._piper_key = None
+        self._piper     = None
 
-    # ── Vosk ──────────────────────────────────────────────────────────────────
     def get_vosk(self, model_dir: str) -> vosk.Model:
         if self._vosk_key == model_dir:
             return self._vosk
-        print(f"  [Cache] Unloading Vosk, loading: {os.path.basename(model_dir)}")
+        print(f"  [Cache] Loading Vosk: {os.path.basename(model_dir)}")
         self._vosk = None
         gc.collect()
         self._vosk = vosk.Model(model_dir)
         self._vosk_key = model_dir
         return self._vosk
 
-    # ── MT ────────────────────────────────────────────────────────────────────
-    def get_mt(self, model_dir: str) -> MTModel:
+    def get_mt(self, model_dir: str):
         if self._mt_key == model_dir:
             return self._mt
-        print(f"  [Cache] Unloading MT, loading: {os.path.basename(model_dir)}")
+        print(f"  [Cache] Loading MT: {os.path.basename(model_dir)}")
         self._mt = None
         gc.collect()
         self._mt = _load_ct2(model_dir)
         self._mt_key = model_dir
         return self._mt
 
-    # ── Piper ─────────────────────────────────────────────────────────────────
     def get_piper(self, onnx_path: str):
         if not PIPER_AVAILABLE or not os.path.isfile(onnx_path):
             return None
         if self._piper_key == onnx_path:
             return self._piper
-        print(f"  [Cache] Unloading Piper, loading: {os.path.basename(onnx_path)}")
+        print(f"  [Cache] Loading Piper: {os.path.basename(onnx_path)}")
         self._piper = None
         gc.collect()
         json_path = onnx_path + ".json"
@@ -177,16 +160,16 @@ class LazyModelCache:
         self._vosk = self._mt = self._piper = None
         self._vosk_key = self._mt_key = self._piper_key = None
         gc.collect()
+        print("  [Cache] All models unloaded.")
 
 
-# Global cache instance
 _cache = LazyModelCache()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model loading helpers
+# Model loading
 # ─────────────────────────────────────────────────────────────────────────────
-def _load_ct2(model_dir: str) -> MTModel:
+def _load_ct2(model_dir: str):
     for f in ("model.bin", "source.spm", "target.spm"):
         p = os.path.join(model_dir, f)
         if not os.path.isfile(p):
@@ -202,7 +185,7 @@ def _load_ct2(model_dir: str) -> MTModel:
     sp_src.load(os.path.join(model_dir, "source.spm"))
     sp_tgt = spm.SentencePieceProcessor()
     sp_tgt.load(os.path.join(model_dir, "target.spm"))
-    return MTModel(translator, sp_src, sp_tgt)
+    return translator, sp_src, sp_tgt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,10 +211,12 @@ def _load_image(board, filepath: str):
 def update_display(board, state: State, images: dict):
     if board is None:
         return
-    key = state.name.lower()
-    img = images.get(key)
+    img = images.get(state.name.lower())
     if img:
-        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img)
+        try:
+            board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img)
+        except Exception as e:
+            print(f"  [Display] Error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -360,15 +345,15 @@ def _clean(text: str) -> str:
     return " ".join(text.split()).strip()
 
 
-def translate(mt: MTModel, text: str) -> str:
+def translate(translator, sp_src, sp_tgt, text: str) -> str:
     if not text.strip():
         return ""
     results = []
     for sent in (_split_sentences(text) or [text]):
-        toks = mt.sp_src.encode(sent, out_type=str)
-        if mt.sp_src.piece_to_id("</s>") != mt.sp_src.unk_id():
+        toks = sp_src.encode(sent, out_type=str)
+        if sp_src.piece_to_id("</s>") != sp_src.unk_id():
             toks = toks + ["</s>"]
-        res = mt.translator.translate_batch(
+        res = translator.translate_batch(
             [toks],
             beam_size=CT2_BEAM_SIZE,
             max_decoding_length=CT2_MAX_DECODING_LEN,
@@ -376,7 +361,7 @@ def translate(mt: MTModel, text: str) -> str:
             repetition_penalty=CT2_REPETITION_PENALTY,
         )
         out = [t for t in res[0].hypotheses[0] if t not in {"</s>", "<s>", "<pad>"}]
-        results.append(mt.sp_tgt.decode(out).strip())
+        results.append(sp_tgt.decode(out).strip())
     return _clean(" ".join(results))
 
 
@@ -393,7 +378,6 @@ def _piper_play(voice, text: str):
         stream.stop()
         stream.close()
         return
-
     if hasattr(voice, "synthesize"):
         out_wav = os.path.join(DATA_DIR, "tts_out.wav")
         rate    = getattr(getattr(voice, "config", None), "sample_rate", 22050)
@@ -408,12 +392,10 @@ def _piper_play(voice, text: str):
                 samplerate=rate)
         sd.wait()
         return
-
     raise RuntimeError("No supported synthesize method on PiperVoice.")
 
 
 def speak(text: str, lang: str):
-    """Lazy-load the TTS voice needed, unloading the other to save RAM."""
     if not ENABLE_TTS or not text:
         return
     onnx_path = VOICE_ZH if lang == "zh" else VOICE_EN
@@ -435,11 +417,16 @@ def main():
     board = None
     images = {}
     if WHISPLAY_AVAILABLE:
-        board = WhisPlayBoard()
-        board.set_backlight(50)
-        images["idle"]       = _load_image(board, os.path.join(IMGS_DIR, "passive.jpg"))
-        images["listening"]  = _load_image(board, os.path.join(IMGS_DIR, "recording.jpg"))
-        images["processing"] = _load_image(board, os.path.join(IMGS_DIR, "playing.jpg"))
+        try:
+            board = WhisPlayBoard()
+            board.set_backlight(50)
+            images["idle"]       = _load_image(board, os.path.join(IMGS_DIR, "passive.jpg"))
+            images["listening"]  = _load_image(board, os.path.join(IMGS_DIR, "recording.jpg"))
+            images["processing"] = _load_image(board, os.path.join(IMGS_DIR, "playing.jpg"))
+            print("[INFO] WhisPlay board initialized.")
+        except Exception as e:
+            print(f"[WARN] WhisPlay board init failed: {e} — running in headless mode")
+            board = None
 
     # ── Shared state ──────────────────────────────────────────────────────────
     state          = State.IDLE
@@ -451,15 +438,17 @@ def main():
     def set_state(new_state: State):
         nonlocal state
         state = new_state
-        label = {
+        labels = {
             State.IDLE:       "IDLE       — waiting for button",
             State.LISTENING:  "LISTENING  — recording ...",
             State.PROCESSING: "PROCESSING — translating & speaking ...",
-        }[new_state]
-        print(f"\n[STATE] {label}")
+        }
+        print(f"\n[STATE] {labels[new_state]}")
         update_display(board, new_state, images)
 
     # ── Button callbacks ──────────────────────────────────────────────────────
+    # WhisPlay fires on_button_press on HIGH (button down)
+    # and on_button_release on LOW (button up) via GPIO.BOTH
     def on_press():
         nonlocal press_time
         press_time = time.time()
@@ -471,15 +460,15 @@ def main():
 
         if state == State.IDLE:
             eng_to_cn = duration >= HOLD_DURATION
-            direction = "EN→ZH" if eng_to_cn else "ZH→EN"
-            print(f"[BTN] {'Long' if eng_to_cn else 'Short'} press → starting {direction}")
+            direction = "EN->ZH" if eng_to_cn else "ZH->EN"
+            print(f"[BTN] {'Long' if eng_to_cn else 'Short'} press -> {direction}")
             last_activity = time.time()
             stop_recording.clear()
             set_state(State.LISTENING)
             threading.Thread(target=_recording_thread, daemon=True).start()
 
         elif state == State.LISTENING:
-            print("[BTN] Press → stopping recording")
+            print("[BTN] Press -> stopping recording")
             stop_recording.set()
 
     # ── Recording + processing thread ────────────────────────────────────────
@@ -494,7 +483,6 @@ def main():
         tgt_lang  = "zh"          if eng_to_cn else "en"
         direction = "EN->ZH"      if eng_to_cn else "ZH->EN"
 
-        # Lazy load — only one model in RAM at a time
         print(f"  [Load] Vosk {direction.split('->')[0]} ...")
         vosk_model = _cache.get_vosk(vosk_dir)
 
@@ -510,10 +498,10 @@ def main():
             threading.Thread(target=_recording_thread, daemon=True).start()
             return
 
-        print(f"  [Load] MT model {direction} ...")
-        mt  = _cache.get_mt(mt_dir)
+        print(f"  [Load] MT {direction} ...")
+        translator, sp_src, sp_tgt = _cache.get_mt(mt_dir)
         t0  = time.time()
-        out = translate(mt, text)
+        out = translate(translator, sp_src, sp_tgt, text)
         print(f"  [{direction}] {text}\n  ->  {out}  [{time.time()-t0:.2f}s]")
 
         speak(out, tgt_lang)
@@ -525,13 +513,23 @@ def main():
         threading.Thread(target=_recording_thread, daemon=True).start()
 
     # ── Register button callbacks ─────────────────────────────────────────────
-    
-    board.on_button_press(on_press)
-    board.on_button_release(on_release)
+    if board:
+        board.on_button_press(on_press)
+        board.on_button_release(on_release)
+    else:
+        # Headless keyboard fallback — press ENTER to simulate button
+        print("[INFO] No board — press ENTER to simulate button press/release.")
+        def _keyboard_thread():
+            while True:
+                input()
+                on_press()
+                sleep(0.1)
+                on_release()
+        threading.Thread(target=_keyboard_thread, daemon=True).start()
 
     set_state(State.IDLE)
-    print("Button: LONG press  = start speaking English first (EN→ZH)")
-    print("        SHORT press = start speaking Chinese first (ZH→EN)")
+    print("Button: LONG press  (>=1s) = EN->ZH")
+    print("        SHORT press (<1s)  = ZH->EN")
     print()
 
     # ── Main loop — timeout watchdog ─────────────────────────────────────────
