@@ -455,7 +455,7 @@ def main():
 
     # ── STEP 2: Resolve hw device string from env (set by .sh) ───────────────
     card_index = os.environ.get("WM8960_CARD_INDEX", "1").strip()
-    hw_device  = f"hw:{card_index},0"
+    hw_device  = f"plughw:{card_index},0"
     print(f"[Audio] output hw device: {hw_device}")
 
     # ── STEP 3: Detect mic input device ──────────────────────────────────────
