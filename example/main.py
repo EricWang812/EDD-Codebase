@@ -9,8 +9,8 @@ Hardware: WhisPlay HAT (Raspberry Pi / Radxa)
   - 10s inactivity timeout = return to IDLE, requires fresh button press
 
 Install deps:
-    pip install vosk ctranslate2 sentencepiece sounddevice numpy piper-tts pillow pygame
-    sudo apt install espeak-ng libportaudio2 portaudio19-dev
+    pip install vosk ctranslate2 sentencepiece sounddevice numpy piper-tts pillow
+    sudo apt install espeak-ng libportaudio2 portaudio19-dev alsa-utils
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ import sounddevice as sd
 import vosk
 import ctranslate2
 import sentencepiece as spm
-import pygame
 
 try:
     from piper.voice import PiperVoice
@@ -115,7 +114,7 @@ class AppState:
     piper_zh: object
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Audio device detection (input only — pygame handles output)
+# Audio device detection (input only — aplay handles output)
 # ─────────────────────────────────────────────────────────────────────────────
 def _find_sd_input_device() -> Optional[int]:
     """
@@ -401,10 +400,11 @@ def translate(mt: MTModel, text: str) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TTS
-# Piper synthesizes to a WAV file, then pygame.mixer.Sound plays it back —
-# identical to how the test script does: sound = pygame.mixer.Sound(file); sound.play()
+# Piper synthesizes to a WAV file, then aplay plays it back directly on the
+# wm8960 card — no pygame, no SDL, no device guessing.
+# aplay -D hw:<card>,0 is the same device the .sh already verified works.
 # ─────────────────────────────────────────────────────────────────────────────
-def speak(app: AppState, text: str, lang: str):
+def speak(app: AppState, text: str, lang: str, hw_device: str):
     if not ENABLE_TTS or not text:
         return
 
@@ -414,6 +414,7 @@ def speak(app: AppState, text: str, lang: str):
         return
 
     try:
+        # Synthesize to WAV
         rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
         with wave.open(TTS_OUT_FILE, "wb") as wf:
             wf.setnchannels(1)
@@ -421,11 +422,14 @@ def speak(app: AppState, text: str, lang: str):
             wf.setframerate(rate)
             voice.synthesize(text, wf)
 
-        sound = pygame.mixer.Sound(TTS_OUT_FILE)
-        sound.play()
-        while pygame.mixer.get_busy():
-            sleep(0.1)
+        # Play with aplay pointing directly at the wm8960 hw device
+        subprocess.run(
+            ["aplay", "-D", hw_device, TTS_OUT_FILE],
+            check=True
+        )
 
+    except subprocess.CalledProcessError as e:
+        print(f"  [TTS] aplay error: {e}")
     except Exception as e:
         print(f"  [TTS] Error: {e}")
 
@@ -433,11 +437,7 @@ def speak(app: AppState, text: str, lang: str):
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    # ── STEP 1: pygame mixer — no args, identical to the test script ──────────
-    pygame.mixer.init()
-    print("[Audio] pygame mixer initialized.")
-
-    # ── STEP 2: Board + idle image ────────────────────────────────────────────
+    # ── STEP 1: Board + idle image ────────────────────────────────────────────
     board = WhisPlayBoard()
     board.set_backlight(50)
 
@@ -453,10 +453,15 @@ def main():
     else:
         print("[Display] WARNING: idle image missing or failed to load.")
 
+    # ── STEP 2: Resolve hw device string from env (set by .sh) ───────────────
+    card_index = os.environ.get("WM8960_CARD_INDEX", "1").strip()
+    hw_device  = f"hw:{card_index},0"
+    print(f"[Audio] output hw device: {hw_device}")
+
     # ── STEP 3: Detect mic input device ──────────────────────────────────────
     in_device = _find_sd_input_device()
 
-    # ── STEP 4: Set speaker volume — identical to the test script ─────────────
+    # ── STEP 4: Set speaker volume ────────────────────────────────────────────
     card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard")
     try:
         subprocess.run(
@@ -543,7 +548,7 @@ def main():
         out = translate(mt, text)
         print(f"  [{direction}] {text}\n  →  {out}  [{time.time()-t0:.2f}s]")
 
-        speak(app, out, tgt_lang)
+        speak(app, out, tgt_lang, hw_device)
 
         eng_to_cn[0]     = not eng_to_cn[0]
         last_activity[0] = time.time()
@@ -577,7 +582,6 @@ def main():
     except KeyboardInterrupt:
         print("\nExiting ...")
         stop_recording.set()
-        pygame.mixer.quit()
         board.cleanup()
 
 
