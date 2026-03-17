@@ -17,8 +17,6 @@ if [ -z "$card_index" ]; then
 fi
 echo "Using sound card index: $card_index"
 
-AUDIODEV=hw:$card_index,0 python test.py $@
-
 # ── Export audio env vars for Python ─────────────────────────────────────────
 export WM8960_CARD_INDEX="$card_index"
 export WM8960_CARD_NAME="wm8960soundcard"
@@ -70,4 +68,5 @@ fi
 
 echo "Starting translator ..."
 echo ""
-exec python3 "$MAIN_PY" "$@"
+AUDIODEV=hw:$card_index,0 python main.py $@
+# exec python3 "$MAIN_PY" "$@"
