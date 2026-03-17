@@ -9,7 +9,6 @@ aplay -l 2>/dev/null || true
 echo ""
 
 # ── Find wm8960 card index ────────────────────────────────────────────────────
-# Find the sound card index for wm8960soundcard
 card_index=$(awk '/wm8960soundcard/ {print $1}' /proc/asound/cards | head -n1)
 # Default to 1 if not found
 if [ -z "$card_index" ]; then
@@ -57,6 +56,19 @@ echo "ALSA_CONFIG_PATH=$ALSA_CONFIG_PATH"
 echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
 echo ""
 
+# ── Sanity checks ─────────────────────────────────────────────────────────────
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[ERROR] python3 not found in PATH"
+  exit 1
+fi
+if ! command -v arecord >/dev/null 2>&1; then
+  echo "[ERROR] arecord not found — install with: sudo apt install -y alsa-utils"
+  exit 1
+fi
+if ! command -v aplay >/dev/null 2>&1; then
+  echo "[ERROR] aplay not found — install with: sudo apt install -y alsa-utils"
+  exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAIN_PY="$SCRIPT_DIR/main.py"
@@ -68,5 +80,4 @@ fi
 
 echo "Starting translator ..."
 echo ""
-AUDIODEV=hw:$card_index,0 python main.py $@
-# exec python3 "$MAIN_PY" "$@"
+exec python3 "$MAIN_PY" "$@"

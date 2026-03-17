@@ -449,13 +449,17 @@ def speak(app: AppState, text: str, lang: str):
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    board = WhisPlayBoard()
-    board.set_backlight(50)
     # ── STEP 1: pygame mixer init ─────────────────────────────────────────────
+    card_idx = os.environ.get("WM8960_CARD_INDEX", "1").strip()
+    os.environ["SDL_AUDIODRIVER"] = "alsa"
+    os.environ["AUDIODEV"] = f"hw:{card_idx},0"
+    print(f"[Audio] pygame will use AUDIODEV={os.environ['AUDIODEV']}")
     pygame.mixer.init()
     print("[Audio] pygame mixer initialized.")
 
     # ── STEP 2: Board + idle image FIRST ──────────────────────────────────────
+    board = WhisPlayBoard()
+    board.set_backlight(50)
 
     images = {
         "idle":       _load_image(board, os.path.join(IMGS_DIR, "passive.jpg")),
