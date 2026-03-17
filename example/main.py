@@ -3,12 +3,13 @@ WhisPlay HAT Translator — EN <-> ZH
 Vosk STT  +  CTranslate2 OPUS MT  +  Piper TTS
 
 Hardware: WhisPlay HAT (Raspberry Pi)
-  - Button: short press = start in Chinese first, long press = start in English first
-  - Next press after speech = stop recording → translate → speak → wait for next
-  - 15s silence timeout = auto-stop conversation, return to IDLE
+  - Button: long press (≥1s) = start with English speaker first (EN→ZH)
+  - Button: short press (<1s) = start with Chinese speaker first (ZH→EN)
+  - Next press while recording = stop → translate → speak → swap sides
+  - 15s inactivity timeout = return to IDLE
 
 Install deps:
-    pip install vosk ctranslate2 sentencepiece sounddevice numpy piper-tts
+    pip install vosk ctranslate2 sentencepiece sounddevice numpy piper-tts pillow
     sudo apt install espeak-ng
 """
 
@@ -20,6 +21,7 @@ import os
 import re
 import sys
 import time
+import threading
 import wave
 from dataclasses import dataclass
 from enum import Enum
@@ -51,9 +53,9 @@ except ImportError:
 # State Machine
 # ─────────────────────────────────────────────────────────────────────────────
 class State(Enum):
-    IDLE       = 0   # waiting for button press
-    LISTENING  = 1   # recording mic input
-    PROCESSING = 2   # translating + speaking
+    IDLE       = 0
+    LISTENING  = 1
+    PROCESSING = 2
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Paths
@@ -68,8 +70,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 REC_FILE      = os.path.join(DATA_DIR, "recorded_voice.wav")
 VOSK_EN_DIR   = os.path.join(MODELS_DIR, "vosk-en")
 VOSK_ZH_DIR   = os.path.join(MODELS_DIR, "vosk-cn")
-CT2_EN_ZH_DIR = os.path.join(MODELS_DIR, "opus-mt-en-zh-ctranslate2")
-CT2_ZH_EN_DIR = os.path.join(MODELS_DIR, "opus-mt-zh-en-ctranslate2")
+CT2_EN_ZH_DIR = os.path.join(MODELS_DIR, "opus-en-zh-ct2")
+CT2_ZH_EN_DIR = os.path.join(MODELS_DIR, "opus-zh-en-ct2")
 VOICE_EN      = os.path.join(VOICES_DIR, "en_US-lessac-low.onnx")
 VOICE_ZH      = os.path.join(VOICES_DIR, "zh_CN-huayan-x_low.onnx")
 
@@ -85,7 +87,6 @@ CT2_REPETITION_PENALTY = 1.15
 MIC_SAMPLE_RATE  = 16_000
 MIC_CHANNELS     = 1
 MIC_BLOCK_SEC    = 0.25
-SILENCE_RMS      = 300
 
 HOLD_DURATION    = 1.0   # seconds — long press threshold
 CONVO_TIMEOUT    = 15.0  # seconds — inactivity → back to IDLE
@@ -109,6 +110,53 @@ class AppState:
     zh_en:    MTModel
     piper_en: object
     piper_zh: object
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Display helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_image(board, filepath: str):
+    """Load an image as RGB565 for the WhisPlay LCD, with aspect-ratio crop."""
+    try:
+        from PIL import Image
+        img = Image.open(filepath).convert("RGB")
+        ow, oh = img.size
+        sw, sh = board.LCD_WIDTH, board.LCD_HEIGHT
+
+        if (ow / oh) > (sw / sh):
+            # Wider than screen — scale to height, crop width
+            nh = sh
+            nw = int(nh * ow / oh)
+            img = img.resize((nw, nh))
+            ox = (nw - sw) // 2
+            img = img.crop((ox, 0, ox + sw, sh))
+        else:
+            # Taller than screen — scale to width, crop height
+            nw = sw
+            nh = int(nw * oh / ow)
+            img = img.resize((nw, nh))
+            oy = (nh - sh) // 2
+            img = img.crop((0, oy, sw, oy + sh))
+
+        data = []
+        for y in range(sh):
+            for x in range(sw):
+                r, g, b = img.getpixel((x, y))
+                rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                data.extend([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF])
+        return data
+    except Exception as e:
+        print(f"  [Display] Could not load image {filepath}: {e}")
+        return None
+
+
+def update_display(board, state: State, images: dict):
+    """Push the correct image to the LCD for the current state."""
+    if board is None:
+        return
+    key = state.name.lower()  # "idle" / "listening" / "processing"
+    img = images.get(key)
+    if img:
+        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model loading
@@ -167,36 +215,6 @@ def init_app() -> AppState:
     return AppState(vosk_en, vosk_zh, en_zh, zh_en, piper_en, piper_zh)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Display helpers
-# ─────────────────────────────────────────────────────────────────────────────
-def _load_image(board, filepath: str):
-    """Load a JPEG as RGB565 for the WhisPlay LCD."""
-    try:
-        from PIL import Image
-        img = Image.open(filepath).convert("RGB")
-        img = img.resize((board.LCD_WIDTH, board.LCD_HEIGHT))
-        data = []
-        for y in range(board.LCD_HEIGHT):
-            for x in range(board.LCD_WIDTH):
-                r, g, b = img.getpixel((x, y))
-                rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-                data.extend([(rgb565 >> 8) & 0xFF, rgb565 & 0xFF])
-        return data
-    except Exception as e:
-        print(f"  [Display] Could not load image {filepath}: {e}")
-        return None
-
-
-def update_display(board, state: State, images: dict):
-    """Push the correct image to the LCD for the current state."""
-    if board is None:
-        return
-    key = state.name.lower()   # "idle" / "listening" / "processing"
-    img = images.get(key)
-    if img:
-        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img)
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Audio pre-processing
 # ─────────────────────────────────────────────────────────────────────────────
 def _normalize_audio(audio: np.ndarray) -> np.ndarray:
@@ -209,20 +227,15 @@ def _normalize_audio(audio: np.ndarray) -> np.ndarray:
     return np.clip(audio.astype(np.float32) * scale, -32768, 32767).astype(np.int16)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Recording — mic via sounddevice (works on Pi with ALSA/PulseAudio)
+# Recording
 # ─────────────────────────────────────────────────────────────────────────────
 def record_until_button(stop_event) -> str:
-    """
-    Record from mic into REC_FILE.
-    Stops when stop_event is set (button pressed) OR after MAX_RECORD_SEC.
-    Returns path to WAV file.
-    """
     MAX_RECORD_SEC = 30
     block_size = int(MIC_SAMPLE_RATE * MIC_BLOCK_SEC)
     max_blocks = int(MAX_RECORD_SEC / MIC_BLOCK_SEC)
     frames = []
 
-    print(f"  [MIC] Recording — press button to stop ...")
+    print("  [MIC] Recording — press button to stop ...")
     with sd.InputStream(samplerate=MIC_SAMPLE_RATE, channels=MIC_CHANNELS,
                         dtype="int16", blocksize=block_size) as stream:
         for _ in range(max_blocks):
@@ -388,35 +401,12 @@ def speak(app: AppState, text: str, lang: str):
     print(f"  [TTS] No TTS available for lang={lang}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main conversation loop with WhisPlay button state machine
-#
-# FIX: The original code used on_press + on_release with a press_time delta
-# to detect long vs short press. The WhisPlay driver only supports a single
-# on_button_press callback (no release event), matching the working demo.
-# Long-press detection is now done inside the single callback by tracking
-# how long the button is held via a blocking poll on the GPIO pin directly,
-# OR — since the driver gives us no hold duration — we fall back to a simple
-# toggle: first press = IDLE→LISTENING, next press = stop recording.
-#
-# STATE FLOW:
-#   IDLE
-#     └─ press → eng_to_cn toggled by a separate short/long detector thread
-#              → LISTENING
-#
-#   LISTENING  (recording mic)
-#     └─ press → stop recording → PROCESSING
-#     └─ 15s timeout → stop recording → IDLE
-#
-#   PROCESSING
-#     └─ STT → translate → speak → LISTENING (direction swapped)
-#     └─ if empty result → LISTENING again (same direction)
+# Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    import threading
-
-    app = init_app()
-
-    # ── Board init ────────────────────────────────────────────────────────────
+    # ── STEP 1: Board + idle image FIRST, before any slow model loading ───────
+    # This matches the working demo — the HAT is live and showing a screen
+    # immediately at startup, not after a 30-second model load delay.
     board = None
     images = {}
     if WHISPLAY_AVAILABLE:
@@ -425,21 +415,28 @@ def main():
         images["idle"]       = _load_image(board, os.path.join(IMGS_DIR, "passive.jpg"))
         images["listening"]  = _load_image(board, os.path.join(IMGS_DIR, "recording.jpg"))
         images["processing"] = _load_image(board, os.path.join(IMGS_DIR, "playing.jpg"))
+        # Draw idle image immediately — board is live before models load
+        if images["idle"]:
+            board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, images["idle"])
+            print("[Display] Idle image shown.")
+        else:
+            print("[Display] WARNING: idle image missing or failed to load.")
 
-    # ── Shared state ──────────────────────────────────────────────────────────
-    state          = State.IDLE
-    eng_to_cn      = True
-    last_activity  = 0.0
+    # ── STEP 2: Load models (slow — HAT already showing image above) ──────────
+    app = init_app()
+
+    # ── Shared mutable state ──────────────────────────────────────────────────
+    # Use single-element lists instead of bare variables — this makes them
+    # safely writable from nested closures and threads without 'nonlocal'
+    # scoping bugs (which only work one level deep in Python).
+    state          = [State.IDLE]
+    eng_to_cn      = [True]      # True = EN speaker first (EN→ZH)
+    last_activity  = [0.0]
+    press_time     = [0.0]       # timestamp of last button press
     stop_recording = threading.Event()
 
-    # These are written from the button callback (runs in the driver's thread)
-    # and read from the main/recording threads — use a lock for safety.
-    _lock          = threading.Lock()
-    _press_time    = [0.0]   # mutable container so closure can write it
-
     def set_state(new_state: State):
-        nonlocal state
-        state = new_state
+        state[0] = new_state
         label = {
             State.IDLE:       "IDLE       — waiting for button",
             State.LISTENING:  "LISTENING  — recording ...",
@@ -448,58 +445,58 @@ def main():
         print(f"\n[STATE] {label}")
         update_display(board, new_state, images)
 
-    # ── Single button callback (matches WhisPlay driver API) ──────────────────
-    # The driver calls this once per press (no release event).
-    # Long-press detection: we record the time on press and spawn a small
-    # thread that waits HOLD_DURATION; if a second event hasn't fired by then
-    # we treat it as a long press.  Because the driver only gives us press
-    # events (not release), we use a simple two-call scheme:
-    #   • call 1 while IDLE  → record press time, schedule long-press check
-    #   • call 2 while LISTENING → stop recording
+    # ── Single button callback — matches working WhisPlay demo API ────────────
+    # The WhisPlay driver only exposes on_button_press (press-down edge).
+    # There is no on_button_release, so long/short press is detected by timing:
+    #
+    #   Press → record timestamp → spawn timer thread that sleeps HOLD_DURATION
+    #         → when timer wakes, check elapsed since press:
+    #             ≥ HOLD_DURATION → long press (user still holding or just let go)
+    #             <  HOLD_DURATION → short press (user released before threshold)
+    #
+    # This only works for the IDLE→LISTENING transition. While LISTENING, any
+    # press immediately stops the recording (no hold logic needed there).
     def on_button_pressed():
-        nonlocal eng_to_cn, last_activity, stop_recording
+        now = time.time()
 
-        if state == State.IDLE:
-            # Record when the button went down so we can measure hold time.
-            _press_time[0] = time.time()
+        if state[0] == State.IDLE:
+            press_time[0] = now
 
-            # Spawn a thread that waits for HOLD_DURATION then decides direction.
-            def _decide_direction():
-                nonlocal eng_to_cn, last_activity
+            def _start_after_hold():
                 sleep(HOLD_DURATION)
-                held = time.time() - _press_time[0]
-                if held >= HOLD_DURATION:
-                    eng_to_cn = True
-                    print("[BTN] Long press → starting EN→ZH")
+                elapsed = time.time() - press_time[0]
+                if elapsed >= HOLD_DURATION:
+                    eng_to_cn[0] = True
+                    print("[BTN] Long press → English first (EN→ZH)")
                 else:
-                    eng_to_cn = False
-                    print("[BTN] Short press → starting ZH→EN")
+                    eng_to_cn[0] = False
+                    print("[BTN] Short press → Chinese first (ZH→EN)")
 
-                last_activity = time.time()
+                last_activity[0] = time.time()
                 stop_recording.clear()
                 set_state(State.LISTENING)
                 threading.Thread(target=_recording_thread, daemon=True).start()
 
-            threading.Thread(target=_decide_direction, daemon=True).start()
+            threading.Thread(target=_start_after_hold, daemon=True).start()
             return
 
-        if state == State.LISTENING:
+        if state[0] == State.LISTENING:
             print("[BTN] Press → stopping recording")
             stop_recording.set()
-            # Processing happens inside _recording_thread once it unblocks.
+            # _recording_thread wakes from record_until_button and takes over
 
     # ── Recording + processing thread ────────────────────────────────────────
     def _recording_thread():
-        nonlocal eng_to_cn, last_activity, stop_recording
-
         record_until_button(stop_recording)
 
         set_state(State.PROCESSING)
 
-        vosk_model = app.vosk_en if eng_to_cn else app.vosk_zh
-        mt         = app.en_zh   if eng_to_cn else app.zh_en
-        tgt_lang   = "zh"        if eng_to_cn else "en"
-        direction  = "EN->ZH"    if eng_to_cn else "ZH->EN"
+        # Snapshot direction now before any async state change
+        is_en_first = eng_to_cn[0]
+        direction  = "EN→ZH" if is_en_first else "ZH→EN"
+        vosk_model = app.vosk_en if is_en_first else app.vosk_zh
+        mt         = app.en_zh   if is_en_first else app.zh_en
+        tgt_lang   = "zh"        if is_en_first else "en"
 
         raw  = _transcribe_wav(vosk_model, REC_FILE)
         text = _dedup_stt(raw)
@@ -507,7 +504,7 @@ def main():
 
         if not text:
             print("  Nothing recognised — returning to LISTEN.")
-            last_activity = time.time()
+            last_activity[0] = time.time()
             stop_recording.clear()
             set_state(State.LISTENING)
             threading.Thread(target=_recording_thread, daemon=True).start()
@@ -515,31 +512,34 @@ def main():
 
         t0  = time.time()
         out = translate(mt, text)
-        print(f"  [{direction}] {text}\n  ->  {out}  [{time.time()-t0:.2f}s]")
+        print(f"  [{direction}] {text}\n  →  {out}  [{time.time()-t0:.2f}s]")
 
         speak(app, out, tgt_lang)
 
-        eng_to_cn = not eng_to_cn
-        last_activity = time.time()
+        # Swap direction for the other speaker's turn
+        eng_to_cn[0] = not eng_to_cn[0]
+        last_activity[0] = time.time()
 
         stop_recording.clear()
         set_state(State.LISTENING)
         threading.Thread(target=_recording_thread, daemon=True).start()
 
-    # ── Register button callback — single callback, same as working demo ──────
+    # ── Register button callback ──────────────────────────────────────────────
     if board:
         board.on_button_press(on_button_pressed)
 
-    # ── Initial display ───────────────────────────────────────────────────────
+    # ── Confirm idle state in display + console ───────────────────────────────
+    # Note: idle image was already drawn at startup above.
+    # set_state here just re-draws it (harmless) and prints the label.
     set_state(State.IDLE)
-    print("Button: LONG press (hold ≥1s then release) = start speaking English first")
-    print("        SHORT press                         = start speaking Chinese first")
+    print("Button: LONG press  (hold ≥1s) = English speaker goes first (EN→ZH)")
+    print("        SHORT press            = Chinese speaker goes first  (ZH→EN)")
 
-    # ── Main loop — timeout watchdog ─────────────────────────────────────────
+    # ── Main loop — inactivity watchdog ──────────────────────────────────────
     try:
         while True:
-            if state != State.IDLE:
-                if time.time() - last_activity > CONVO_TIMEOUT:
+            if state[0] != State.IDLE:
+                if time.time() - last_activity[0] > CONVO_TIMEOUT:
                     print("\n[TIMEOUT] 15s inactivity — returning to IDLE.")
                     stop_recording.set()
                     sleep(0.5)
