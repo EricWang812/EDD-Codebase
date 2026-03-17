@@ -1,19 +1,14 @@
 """
-WhisPlay HAT Translator — EN <-> ZH  (Raspberry Pi Zero 2W)
-Vosk STT  +  CTranslate2 OPUS MT  +  Piper TTS
+Pi 5 Translator — EN <-> ZH
+Vosk STT  +  CTranslate2 OPUS MT  +  Piper TTS (ARM64 binary)
 
-Hardware: WhisPlay HAT
-  - SHORT press = start ZH→EN conversation
-  - LONG  press (≥1s) = start EN→ZH conversation
-  - Press again while recording = stop and translate
-  - 15s inactivity timeout = back to IDLE
+Install deps:
+    pip install vosk ctranslate2 sentencepiece sounddevice numpy
 
-Run with:
-    bash run_translator.sh
-
-REQUIRED — use SMALL vosk models only (large models will OOM crash):
-    models/vosk-en  →  vosk-model-small-en-us-0.15   (~40 MB)
-    models/vosk-cn  →  vosk-model-small-cn-0.22       (~40 MB)
+Piper TTS (ARM64 binary — do NOT use pip install piper-tts on Pi):
+    wget https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_aarch64.tar.gz
+    tar -xzf piper_linux_aarch64.tar.gz -C ~/piper
+    # Then confirm PIPER_BINARY path below
 """
 
 from __future__ import annotations
@@ -21,15 +16,13 @@ from __future__ import annotations
 import io
 import json
 import os
-import queue
 import re
+import subprocess
 import sys
 import time
-import threading
 import wave
 from dataclasses import dataclass
-from enum import Enum
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import sounddevice as sd
@@ -37,71 +30,48 @@ import vosk
 import ctranslate2
 import sentencepiece as spm
 
-try:
-    from piper.voice import PiperVoice
-    PIPER_AVAILABLE = True
-except ImportError:
-    PIPER_AVAILABLE = False
-    print("[WARN] piper-tts not installed — run: pip install piper-tts")
-
-sys.path.append(os.path.abspath("../Driver"))
-from WhisPlay import WhisPlayBoard
-
 # ─────────────────────────────────────────────────────────────────────────────
-# State Machine
-# ─────────────────────────────────────────────────────────────────────────────
-class State(Enum):
-    IDLE       = 0
-    LISTENING  = 1
-    PROCESSING = 2
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Paths
+# Paths — edit these to match your layout
 # ─────────────────────────────────────────────────────────────────────────────
 HERE       = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(HERE, "models")
 DATA_DIR   = os.path.join(HERE, "data")
 VOICES_DIR = os.path.join(HERE, "voices")
-IMGS_DIR   = os.path.join(HERE, "imgs")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 REC_FILE      = os.path.join(DATA_DIR, "recorded_voice.wav")
-VOSK_EN_DIR   = os.path.join(MODELS_DIR, "vosk-en")
-VOSK_ZH_DIR   = os.path.join(MODELS_DIR, "vosk-cn")
+
+# Vosk — use full models on Pi 5 (not -small); much better accuracy
+VOSK_EN_DIR   = os.path.join(MODELS_DIR, "vosk-model-en-us-0.22")
+VOSK_ZH_DIR   = os.path.join(MODELS_DIR, "vosk-model-cn-0.22")
+
+# CTranslate2 OPUS-MT models
 CT2_EN_ZH_DIR = os.path.join(MODELS_DIR, "opus-en-zh-ct2")
 CT2_ZH_EN_DIR = os.path.join(MODELS_DIR, "opus-zh-en-ct2")
-VOICE_EN      = os.path.join(VOICES_DIR, "en_US-lessac-low.onnx")
-VOICE_ZH      = os.path.join(VOICES_DIR, "zh_CN-huayan-x_low.onnx")
+
+# Piper TTS — ARM64 binary + ONNX voice files
+# Download: https://github.com/rhasspy/piper/releases  (piper_linux_aarch64.tar.gz)
+PIPER_BINARY  = os.path.expanduser("~/piper/piper")
+VOICE_EN      = os.path.join(VOICES_DIR, "en_US-lessac-medium.onnx")   # medium quality fine on Pi 5
+VOICE_ZH      = os.path.join(VOICES_DIR, "zh_CN-huayan-x-low.onnx")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Settings
+# Tuning — relaxed for Pi 5 (4-core A76, 4–8 GB RAM)
 # ─────────────────────────────────────────────────────────────────────────────
-
-# CTranslate2 — pin threads to avoid thrashing Pi Zero 2W's 4 slow cores.
-# 1 inter + 2 intra leaves 1-2 cores free for OS/GPIO/audio.
-CT2_INTER_THREADS      = 1
-CT2_INTRA_THREADS      = 2
-CT2_COMPUTE_TYPE       = "int8"
-CT2_BEAM_SIZE          = 2
-CT2_MAX_DECODING_LEN   = 256
+CT2_COMPUTE_TYPE       = "int8"   # try "float32" if translation quality feels off
+CT2_BEAM_SIZE          = 4        # was 2 — better quality, Pi 5 can handle it
+CT2_MAX_DECODING_LEN   = 512      # was 256
 CT2_NO_REPEAT_NGRAM    = 3
 CT2_REPETITION_PENALTY = 1.15
 
-MIC_SAMPLE_RATE  = 16_000
-MIC_CHANNELS     = 1
-MIC_BLOCK_SEC    = 0.25
-MAX_RECORD_SEC   = 30
-
-HOLD_DURATION  = 1.0   # seconds — long press threshold
-CONVO_TIMEOUT  = 15.0  # seconds inactivity → IDLE
+MIC_SAMPLE_RATE = 16_000
+MIC_CHANNELS    = 1
+MIC_BLOCK_SEC   = 0.1             # was 0.25 — finer VAD on faster CPU
+SILENCE_TIMEOUT = 2.0             # was 2.5 — snappier end-of-speech
+MAX_RECORD_SEC  = 30
+SILENCE_RMS     = 300
 
 ENABLE_TTS = True
-
-# Resolved at startup by _find_wm8960_device()
-SD_INPUT_DEVICE  = None
-SD_OUTPUT_DEVICE = None
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data classes
@@ -119,60 +89,24 @@ class AppState:
     vosk_zh:  vosk.Model
     en_zh:    MTModel
     zh_en:    MTModel
-    piper_en: object
-    piper_zh: object
+    piper_ok: bool
+    voice_en: str
+    voice_zh: str
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ALSA / sounddevice device discovery
-# ─────────────────────────────────────────────────────────────────────────────
-def _find_wm8960_device():
-    """
-    Return (input_idx, output_idx) for the wm8960 sound card.
-    Falls back to (None, None) so sounddevice uses its own default.
-    sounddevice/PortAudio ignores the AUDIODEV env var, so we must
-    pass the device index explicitly on every open() call.
-    """
-    try:
-        devices = sd.query_devices()
-        in_idx = out_idx = None
-        for i, d in enumerate(devices):
-            name = d.get("name", "").lower()
-            if "wm8960" in name or "seeed" in name:
-                if d.get("max_input_channels", 0) > 0 and in_idx is None:
-                    in_idx = i
-                if d.get("max_output_channels", 0) > 0 and out_idx is None:
-                    out_idx = i
-        if in_idx is not None:
-            print(f"[AUDIO] input  → device {in_idx}: {devices[in_idx]['name']}")
-        if out_idx is not None:
-            print(f"[AUDIO] output → device {out_idx}: {devices[out_idx]['name']}")
-        if in_idx is None and out_idx is None:
-            print("[AUDIO] wm8960 not found in sounddevice list — using system default")
-        return in_idx, out_idx
-    except Exception as e:
-        print(f"[AUDIO] Device discovery error: {e}")
-        return None, None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Model loading
+# Init
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_ct2(model_dir: str) -> MTModel:
     for f in ("model.bin", "source.spm", "target.spm"):
         p = os.path.join(model_dir, f)
         if not os.path.isfile(p):
-            raise FileNotFoundError(
-                f"Missing model file: {p}\n"
-                "Ensure you are using CTranslate2-converted OPUS-MT models."
-            )
-    # inter_threads=1, intra_threads=2 prevents thread over-subscription on
-    # the Pi Zero 2W's 4 cores (leaves headroom for OS + GPIO + audio).
+            raise FileNotFoundError(f"Missing model file: {p}")
     translator = ctranslate2.Translator(
         model_dir,
         compute_type=CT2_COMPUTE_TYPE,
-        inter_threads=CT2_INTER_THREADS,
-        intra_threads=CT2_INTRA_THREADS,
+        inter_threads=2,   # Pi 5 has 4 cores; 2 threads per translator is efficient
+        intra_threads=2,
     )
     sp_src = spm.SentencePieceProcessor()
     sp_src.load(os.path.join(model_dir, "source.spm"))
@@ -181,126 +115,47 @@ def _load_ct2(model_dir: str) -> MTModel:
     return MTModel(translator, sp_src, sp_tgt)
 
 
-def _load_piper_voice(onnx_path: str):
-    if not PIPER_AVAILABLE:
-        return None
-    if not os.path.isfile(onnx_path):
-        print(f"  [Piper] voice file not found: {onnx_path}")
-        return None
-    json_path = onnx_path + ".json"
-    try:
-        return PiperVoice.load(
-            onnx_path,
-            config_path=json_path if os.path.isfile(json_path) else None,
-            use_cuda=False,
-        )
-    except Exception as e:
-        print(f"  [Piper] load error: {e}")
-        return None
+def _check_piper() -> bool:
+    """Return True only if the Piper binary is executable and voice files exist."""
+    if not os.path.isfile(PIPER_BINARY) or not os.access(PIPER_BINARY, os.X_OK):
+        print(f"  [Piper] binary not found / not executable: {PIPER_BINARY}")
+        print("  Download: https://github.com/rhasspy/piper/releases  (piper_linux_aarch64.tar.gz)")
+        return False
+    missing = [v for v in (VOICE_EN, VOICE_ZH) if not os.path.isfile(v)]
+    if missing:
+        print(f"  [Piper] missing voice files: {missing}")
+        return False
+    print("  [Piper] binary + voices OK")
+    return True
 
 
 def init_app() -> AppState:
-    """
-    Load all models sequentially. On Pi Zero 2W each step takes 5-30s.
-    Total startup ~60-120s is normal — do not kill the process.
-    """
-    print("Loading Vosk EN  (must be vosk-model-small-en-us, ~40MB) ...")
+    vosk.SetLogLevel(-1)   # suppress noisy Vosk logs
+    print("Loading Vosk EN ...")
     vosk_en = vosk.Model(VOSK_EN_DIR)
-
-    print("Loading Vosk ZH  (must be vosk-model-small-cn, ~40MB) ...")
+    print("Loading Vosk ZH ...")
     vosk_zh = vosk.Model(VOSK_ZH_DIR)
-
-    print("Loading EN->ZH translation model ...")
+    print("Loading EN->ZH model ...")
     en_zh = _load_ct2(CT2_EN_ZH_DIR)
-
-    print("Loading ZH->EN translation model ...")
+    print("Loading ZH->EN model ...")
     zh_en = _load_ct2(CT2_ZH_EN_DIR)
 
-    piper_en = piper_zh = None
-    if PIPER_AVAILABLE:
-        print("Loading Piper EN voice ...")
-        piper_en = _load_piper_voice(VOICE_EN)
-        print("Loading Piper ZH voice ...")
-        piper_zh = _load_piper_voice(VOICE_ZH)
-        loaded = [n for n, v in [("EN", piper_en), ("ZH", piper_zh)] if v]
-        print(f"Piper voices loaded: {loaded if loaded else 'none — TTS will be silent'}")
+    piper_ok = False
+    if ENABLE_TTS:
+        print("Checking Piper TTS ...")
+        piper_ok = _check_piper()
+        if not piper_ok:
+            print("  TTS disabled — install Piper ARM64 binary to enable spoken output.")
 
-    print("\nAll models loaded.\n")
-    return AppState(vosk_en, vosk_zh, en_zh, zh_en, piper_en, piper_zh)
+    print("\nReady.\n")
+    return AppState(vosk_en, vosk_zh, en_zh, zh_en, piper_ok, VOICE_EN, VOICE_ZH)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Display helpers
-# ALL LCD/SPI writes must go through _display_queue to the single
-# _display_worker thread. SPI is not thread-safe; the GPIO interrupt thread
-# and main loop would otherwise collide on the bus and cause GPIO errors.
-# ─────────────────────────────────────────────────────────────────────────────
-_display_queue: queue.Queue = queue.Queue()
-
-
-def _load_image_rgb565(board, filepath: str):
-    """
-    Load image and convert to RGB565 byte list using numpy vectorisation.
-    This is ~50x faster than per-pixel getpixel() calls — important on
-    Pi ARM at startup when loading 3 images.
-    """
-    try:
-        from PIL import Image
-        img = Image.open(filepath).convert("RGB")
-        img = img.resize((board.LCD_WIDTH, board.LCD_HEIGHT), Image.BILINEAR)
-        arr = np.array(img, dtype=np.uint16)
-        r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-        rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        high = (rgb565 >> 8).astype(np.uint8)
-        low  = (rgb565 & 0xFF).astype(np.uint8)
-        out = np.empty((board.LCD_HEIGHT, board.LCD_WIDTH, 2), dtype=np.uint8)
-        out[:, :, 0] = high
-        out[:, :, 1] = low
-        return out.flatten().tolist()
-    except Exception as e:
-        print(f"  [Display] Could not load '{filepath}': {e}")
-        return None
-
-
-def _display_worker(board, images: dict):
-    """The ONLY thread that calls board SPI methods."""
-    while True:
-        item = _display_queue.get()
-        if item is None:
-            _display_queue.task_done()
-            break
-        cmd, payload = item
-        try:
-            if cmd == "image":
-                img = images.get(payload)
-                if img:
-                    board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img)
-                else:
-                    print(f"  [Display] No image for key '{payload}'")
-            elif cmd == "rgb":
-                board.set_rgb(*payload)
-            elif cmd == "backlight":
-                board.set_backlight(payload)
-        except Exception as e:
-            print(f"  [Display] Error on '{cmd}': {e}")
-        finally:
-            _display_queue.task_done()
-
-
-def display_image(key: str):
-    _display_queue.put(("image", key))
-
-def display_rgb(r: int, g: int, b: int):
-    _display_queue.put(("rgb", (r, g, b)))
-
-def display_backlight(v: int):
-    _display_queue.put(("backlight", v))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Recording
+# Audio helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _normalize_audio(audio: np.ndarray) -> np.ndarray:
+    """Peak-normalise int16 to ~90 % full scale without clipping."""
     peak = np.abs(audio.astype(np.float32)).max()
     if peak < 1:
         return audio
@@ -310,49 +165,11 @@ def _normalize_audio(audio: np.ndarray) -> np.ndarray:
     return np.clip(audio.astype(np.float32) * scale, -32768, 32767).astype(np.int16)
 
 
-def record_until_stopped(stop_event: threading.Event):
-    """
-    Record mic audio into REC_FILE until stop_event is set or MAX_RECORD_SEC.
-    latency='high' is more stable than 'low' on Pi Zero 2W with PortAudio.
-    """
-    block_size = int(MIC_SAMPLE_RATE * MIC_BLOCK_SEC)
-    max_blocks = int(MAX_RECORD_SEC / MIC_BLOCK_SEC)
-    frames = []
-
-    print("  [MIC] Recording — press button to stop ...")
-    try:
-        with sd.InputStream(
-            device=SD_INPUT_DEVICE,
-            samplerate=MIC_SAMPLE_RATE,
-            channels=MIC_CHANNELS,
-            dtype="int16",
-            blocksize=block_size,
-            latency="high",
-        ) as stream:
-            for _ in range(max_blocks):
-                if stop_event.is_set():
-                    break
-                block, _ = stream.read(block_size)
-                frames.append(block.copy())
-    except Exception as e:
-        print(f"  [MIC] InputStream error: {e}")
-
-    print("  [MIC] Stopped.")
-    if not frames:
-        frames = [np.zeros((block_size, MIC_CHANNELS), dtype=np.int16)]
-
-    audio = np.concatenate(frames, axis=0)
-    with wave.open(REC_FILE, "wb") as wf:
-        wf.setnchannels(MIC_CHANNELS)
-        wf.setsampwidth(2)
-        wf.setframerate(MIC_SAMPLE_RATE)
-        wf.writeframes(audio.tobytes())
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # STT
 # ─────────────────────────────────────────────────────────────────────────────
 _FILLER_RE = re.compile(r'\b(uh+|um+|hmm+|huh|mm+|ah+|er+)\b', re.IGNORECASE)
+
 
 def _strip_fillers(text: str) -> str:
     return ' '.join(_FILLER_RE.sub('', text).split())
@@ -375,13 +192,15 @@ def _transcribe_wav(model: vosk.Model, wav_path: str) -> str:
         wf_out.writeframes(audio.tobytes())
     buf.seek(0)
 
-    rec = vosk.KaldiRecognizer(model, rate)
+    rec          = vosk.KaldiRecognizer(model, rate)
     rec.SetWords(True)
-    parts = []
+    parts        = []
     last_partial = ""
 
+    # Larger read chunk on Pi 5 — 1 s worth of audio, reduces loop overhead
+    CHUNK = MIC_SAMPLE_RATE * 2   # bytes (int16)
     while True:
-        data = buf.read(8000)
+        data = buf.read(CHUNK)
         if not data:
             break
         if rec.AcceptWaveform(data):
@@ -404,8 +223,9 @@ def _transcribe_wav(model: vosk.Model, wav_path: str) -> str:
 
 
 def _dedup_stt(text: str) -> str:
+    """Remove duplicated phrases Vosk occasionally produces."""
     words = text.split()
-    n = len(words)
+    n     = len(words)
     if n == 0:
         return text
     half = n // 2
@@ -421,6 +241,39 @@ def _dedup_stt(text: str) -> str:
     return " ".join(deduped)
 
 
+def record_mic(out_path: str = REC_FILE) -> str:
+    print(f"Listening ... (silence for {SILENCE_TIMEOUT:.1f}s to stop, max {MAX_RECORD_SEC}s)")
+    frames       = []
+    block_size   = int(MIC_SAMPLE_RATE * MIC_BLOCK_SEC)
+    max_silent   = int(SILENCE_TIMEOUT / MIC_BLOCK_SEC)
+    max_blocks   = int(MAX_RECORD_SEC  / MIC_BLOCK_SEC)
+    silent_count = 0
+    started      = False
+
+    with sd.InputStream(samplerate=MIC_SAMPLE_RATE, channels=MIC_CHANNELS,
+                        dtype="int16", blocksize=block_size) as stream:
+        for _ in range(max_blocks):
+            block, _ = stream.read(block_size)
+            rms = float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
+            frames.append(block.copy())
+            if rms > SILENCE_RMS:
+                started      = True
+                silent_count = 0
+            elif started:
+                silent_count += 1
+                if silent_count >= max_silent:
+                    break
+
+    print("Recording stopped.")
+    audio = np.concatenate(frames, axis=0)
+    with wave.open(out_path, "wb") as wf:
+        wf.setnchannels(MIC_CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(MIC_SAMPLE_RATE)
+        wf.writeframes(audio.tobytes())
+    return out_path
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Translation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -428,9 +281,11 @@ def _split_sentences(text: str) -> List[str]:
     parts = re.split(r'(?<=[。！？；.!?;])\s*', text)
     return [p.strip() for p in parts if p.strip()]
 
+
 def _clean(text: str) -> str:
     text = re.sub(r'([\u4e00-\u9fff\u3000-\u303f]{2,6})\1{2,}', r'\1', text)
     return " ".join(text.split()).strip()
+
 
 def translate(mt: MTModel, text: str) -> str:
     if not text.strip():
@@ -453,244 +308,153 @@ def translate(mt: MTModel, text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TTS
+# TTS — Piper via subprocess (ARM64 binary, no pip package needed)
 # ─────────────────────────────────────────────────────────────────────────────
-def _piper_play(voice, text: str):
-    """
-    Play Piper TTS through the wm8960 speaker.
-    Tries streaming first (lower RAM peak), falls back to file-based.
-    SD_OUTPUT_DEVICE passed explicitly — PortAudio ignores AUDIODEV env var.
-    """
-    if hasattr(voice, "synthesize_stream_raw"):
-        rate = voice.config.sample_rate
-        try:
-            stream = sd.OutputStream(
-                device=SD_OUTPUT_DEVICE,
-                samplerate=rate,
-                channels=1,
-                dtype="int16",
-                latency="high",
-            )
-            stream.start()
-            for audio_bytes in voice.synthesize_stream_raw(text):
-                stream.write(np.frombuffer(audio_bytes, dtype=np.int16))
-            stream.stop()
-            stream.close()
-            return
-        except Exception as e:
-            print(f"  [TTS] stream error ({e}) — trying file method")
-
-    if hasattr(voice, "synthesize"):
-        out_wav = os.path.join(DATA_DIR, "tts_out.wav")
-        rate    = getattr(getattr(voice, "config", None), "sample_rate", 22050)
-        with wave.open(out_wav, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(rate)
-            voice.synthesize(text, wf)
-        with wave.open(out_wav, "rb") as wf:
-            data = wf.readframes(wf.getnframes())
-        sd.play(
-            np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0,
-            samplerate=rate,
-            device=SD_OUTPUT_DEVICE,
-        )
-        sd.wait()
-        return
-
-    raise RuntimeError("PiperVoice has no synthesize_stream_raw or synthesize method.")
-
-
 def speak(app: AppState, text: str, lang: str):
-    if not ENABLE_TTS or not text:
+    """
+    Synthesise speech with the Piper binary and play via sounddevice.
+
+    Piper is invoked as:
+        echo "text" | piper --model voice.onnx --output_raw
+    Raw 16-bit PCM is captured and played with sounddevice (no aplay needed).
+    """
+    if not ENABLE_TTS or not text or not app.piper_ok:
         return
-    voice = app.piper_zh if lang == "zh" else app.piper_en
-    if voice:
+
+    voice_path = app.voice_zh if lang == "zh" else app.voice_en
+    json_path  = voice_path + ".json"
+
+    cmd = [PIPER_BINARY, "--model", voice_path, "--output_raw"]
+    if os.path.isfile(json_path):
+        cmd += ["--config", json_path]
+
+    # Infer sample rate from voice config (Piper raw output has no WAV header)
+    sample_rate = 22050   # safe default for en_US-lessac-medium
+    if os.path.isfile(json_path):
         try:
-            _piper_play(voice, text)
-        except Exception as e:
-            print(f"  [TTS] Error: {e}")
-    else:
-        print(f"  [TTS] No voice loaded for lang='{lang}'")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-def main():
-    global SD_INPUT_DEVICE, SD_OUTPUT_DEVICE
-
-    # 1. Find wm8960 device indices for sounddevice
-    SD_INPUT_DEVICE, SD_OUTPUT_DEVICE = _find_wm8960_device()
-
-    # 2. Load models (slow on Pi Zero 2W — 60-120s total is normal)
-    app = init_app()
-
-    # 3. Init WhisPlay hardware
-    board = WhisPlayBoard()
-    board.set_backlight(50)
-
-    # 4. Load display images (numpy-vectorised, fast)
-    print("Loading display images ...")
-    images = {
-        "idle":       _load_image_rgb565(board, os.path.join(IMGS_DIR, "passive.jpg")),
-        "listening":  _load_image_rgb565(board, os.path.join(IMGS_DIR, "listening.jpg")),
-        "processing": _load_image_rgb565(board, os.path.join(IMGS_DIR, "talking.jpg")),
-    }
-
-    # 5. Start single display thread — the ONLY owner of SPI
-    disp_thread = threading.Thread(
-        target=_display_worker, args=(board, images),
-        daemon=True, name="display"
-    )
-    disp_thread.start()
-
-    # 6. Shared state — only written by the main loop below
-    state         = State.IDLE
-    eng_to_cn     = True
-    last_activity = time.time()
-    stop_rec      = threading.Event()
-    rec_thread    = [None]   # list so nested functions can rebind
-
-    # Button callbacks: ONLY enqueue events — never touch state or SPI
-    press_time = [0.0]
-    event_queue: queue.Queue = queue.Queue()
-
-    def on_press():
-        press_time[0] = time.time()
-        event_queue.put(("press", press_time[0]))
-
-    def on_release():
-        event_queue.put(("release", time.time()))
-
-    board.on_button_press(on_press)
-    board.on_button_release(on_release)
-
-    def start_recording():
-        stop_rec.clear()
-        t = threading.Thread(
-            target=record_until_stopped, args=(stop_rec,),
-            daemon=True, name="recorder"
-        )
-        t.start()
-        rec_thread[0] = t
-
-    def stop_recording():
-        stop_rec.set()
-        if rec_thread[0] is not None:
-            rec_thread[0].join(timeout=3.0)
-            rec_thread[0] = None
-
-    def process_audio() -> bool:
-        """STT → translate → TTS speak. Returns True if speech recognised."""
-        nonlocal eng_to_cn, last_activity
-
-        vosk_model = app.vosk_en if eng_to_cn else app.vosk_zh
-        mt         = app.en_zh   if eng_to_cn else app.zh_en
-        tgt_lang   = "zh"        if eng_to_cn else "en"
-        direction  = "EN->ZH"    if eng_to_cn else "ZH->EN"
-
-        print(f"  [STT] Transcribing ({direction}) ...")
-        raw  = _transcribe_wav(vosk_model, REC_FILE)
-        text = _dedup_stt(raw)
-        if raw != text:
-            print(f"  Recognised (deduped): {text}  (raw: {raw})")
-        else:
-            print(f"  Recognised: {text}")
-
-        if not text:
-            print("  Nothing recognised — try again.")
-            return False
-
-        t0  = time.time()
-        out = translate(mt, text)
-        print(f"  [{direction}] {text}\n  ->  {out}  [{time.time()-t0:.1f}s]")
-
-        speak(app, out, tgt_lang)
-        last_activity = time.time()
-        eng_to_cn = not eng_to_cn  # swap direction for next speaker
-        return True
-
-    # 7. Initial display
-    display_image("idle")
-    display_rgb(0, 0, 0)
-    print("Ready.")
-    print("  LONG press  (≥1s) → EN→ZH")
-    print("  SHORT press       → ZH→EN")
-    print("  Press while recording → stop & translate")
-    print(f"  {CONVO_TIMEOUT:.0f}s silence → back to IDLE\n")
-
-    # 8. Main event loop
-    try:
-        while True:
-
-            # Inactivity timeout watchdog
-            if state != State.IDLE:
-                if time.time() - last_activity > CONVO_TIMEOUT:
-                    print("\n[TIMEOUT] Returning to IDLE.")
-                    stop_recording()
-                    state = State.IDLE
-                    display_image("idle")
-                    display_rgb(0, 0, 0)
-
-            # Non-blocking event drain
-            try:
-                event, ts = event_queue.get_nowait()
-            except queue.Empty:
-                time.sleep(0.05)
-                continue
-
-            # IDLE: wait for first button release to determine short/long press
-            if state == State.IDLE:
-                if event == "release":
-                    duration = ts - press_time[0]
-                    if duration >= HOLD_DURATION:
-                        eng_to_cn = True
-                        print("[BTN] Long press  → EN→ZH")
-                    else:
-                        eng_to_cn = False
-                        print("[BTN] Short press → ZH→EN")
-                    last_activity = time.time()
-                    state = State.LISTENING
-                    display_image("listening")
-                    display_rgb(0, 0, 255)
-                    start_recording()
-
-            # LISTENING: next press stops recording and triggers processing
-            elif state == State.LISTENING:
-                if event == "press":
-                    stop_recording()
-                    last_activity = time.time()
-                    state = State.PROCESSING
-                    display_image("processing")
-                    display_rgb(255, 128, 0)
-
-                    # Blocks here during STT + translation + TTS.
-                    # Intentional — simpler and safer than threading it on Pi.
-                    process_audio()
-
-                    # Return to LISTENING for the other speaker
-                    last_activity = time.time()
-                    state = State.LISTENING
-                    display_image("listening")
-                    display_rgb(0, 0, 255)
-                    start_recording()
-
-            # PROCESSING: button ignored (we're blocking in process_audio above)
-
-    except KeyboardInterrupt:
-        print("\nCtrl+C — shutting down ...")
-
-    finally:
-        stop_rec.set()
-        _display_queue.put(None)   # poison pill → stop display thread
-        _display_queue.join()
-        try:
-            board.set_backlight(0)
-            board.cleanup()
+            cfg = json.load(open(json_path))
+            sample_rate = cfg.get("audio", {}).get("sample_rate", sample_rate)
         except Exception:
             pass
-        print("Shutdown complete.")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            input=text.encode("utf-8"),
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            print(f"  [TTS] Piper error: {result.stderr.decode(errors='replace')}")
+            return
+
+        audio = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        sd.play(audio, samplerate=sample_rate)
+        sd.wait()
+
+    except subprocess.TimeoutExpired:
+        print("  [TTS] Piper timed out.")
+    except Exception as e:
+        print(f"  [TTS] Error: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI modes
+# ─────────────────────────────────────────────────────────────────────────────
+def run_typed(app: AppState):
+    en_to_zh = input("Direction — 1=EN->ZH  2=ZH->EN: ").strip() != "2"
+    mt, label, tgt = (
+        (app.en_zh, "EN->ZH", "zh") if en_to_zh
+        else (app.zh_en, "ZH->EN", "en")
+    )
+    text = input("Text: ").strip()
+    t0   = time.time()
+    out  = translate(mt, text)
+    print(f"\n[{label}] {text}\n->  {out}\n[{time.time()-t0:.2f}s]\n")
+    speak(app, out, tgt)
+
+
+def run_wav(app: AppState):
+    en_input = input("Speech language — 1=English  2=Chinese: ").strip() != "2"
+    vosk_model, mt, label, tgt = (
+        (app.vosk_en, app.en_zh, "EN->ZH", "zh") if en_input
+        else (app.vosk_zh, app.zh_en, "ZH->EN", "en")
+    )
+    if not os.path.isfile(REC_FILE):
+        print(f"No WAV found at {REC_FILE}")
+        return
+    text = _transcribe_wav(vosk_model, REC_FILE)
+    print(f"Recognised: {text}")
+    if not text:
+        return
+    t0  = time.time()
+    out = translate(mt, text)
+    print(f"\n[{label}] {text}\n->  {out}\n[{time.time()-t0:.2f}s]\n")
+    speak(app, out, tgt)
+
+
+def run_live_mic(app: AppState):
+    en_input = input("Speak in — 1=English  2=Chinese: ").strip() != "2"
+    vosk_model, mt, label, tgt = (
+        (app.vosk_en, app.en_zh, "EN->ZH", "zh") if en_input
+        else (app.vosk_zh, app.zh_en, "ZH->EN", "en")
+    )
+    wav_path = record_mic()
+    t0   = time.time()
+    raw  = _transcribe_wav(vosk_model, wav_path)
+    text = _dedup_stt(raw)
+    print(f"Recognised: {text}" + (f"  (raw: {raw})" if raw != text else ""))
+    if not text:
+        print("Nothing recognised — try speaking louder or closer to the mic.")
+        return
+    t1  = time.time()
+    out = translate(mt, text)
+    print(f"[{label}] {text}\n->  {out}")
+    print(f"[STT {t1-t0:.2f}s | translate {time.time()-t1:.2f}s | total {time.time()-t0:.2f}s]\n")
+    speak(app, out, tgt)
+
+
+def run_samples(app: AppState):
+    samples = [
+        ("EN->ZH", "I am allergic to peanuts."),
+        ("EN->ZH", "Where is the nearest bathroom?"),
+        ("EN->ZH", "Please call an ambulance."),
+        ("ZH->EN", "你好，我想点一杯咖啡。"),
+        ("ZH->EN", "请问最近的地铁站在哪里？"),
+        ("ZH->EN", "我对花生过敏，请不要放花生。"),
+    ]
+    for label, text in samples:
+        en_to_zh = label == "EN->ZH"
+        mt  = app.en_zh if en_to_zh else app.zh_en
+        tgt = "zh"      if en_to_zh else "en"
+        t0  = time.time()
+        out = translate(mt, text)
+        print(f"\n[{label}] {text}\n->  {out}  [{time.time()-t0:.2f}s]")
+        speak(app, out, tgt)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    app = init_app()
+    while True:
+        print("══════════════════════════════")
+        print("  Pi 5 Translator (EN <-> ZH) ")
+        print("══════════════════════════════")
+        print("  1) Type text  -> translate -> speak")
+        print("  2) WAV file   -> STT -> translate -> speak")
+        print("  3) Quick test samples")
+        print("  4) Live mic   -> STT -> translate -> speak")
+        print("  0) Quit")
+        print("══════════════════════════════")
+        c = input("Choose: ").strip()
+        if   c == "0": break
+        elif c == "1": run_typed(app)
+        elif c == "2": run_wav(app)
+        elif c == "3": run_samples(app)
+        elif c == "4": run_live_mic(app)
+        else:          print("Invalid choice.")
 
 
 if __name__ == "__main__":
