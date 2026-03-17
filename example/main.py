@@ -31,6 +31,29 @@ from typing import List, Optional
 import numpy as np
 import sounddevice as sd
 import vosk
+
+def _get_sd_device():
+    """Find the wm8960 soundcard device index for sounddevice.
+    Reads WM8960_CARD_NAME env var set by the .sh launcher, then falls back
+    to scanning sounddevice's device list directly."""
+    card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard").lower()
+    try:
+        devices = sd.query_devices()
+        for i, dev in enumerate(devices):
+            if card_name in dev["name"].lower() and dev["max_output_channels"] > 0:
+                print(f"[Audio] Using output device {i}: {dev['name']}")
+                return i
+        # Fallback: try card index from env
+        card_idx = os.environ.get("WM8960_CARD_INDEX", "")
+        if card_idx.isdigit():
+            for i, dev in enumerate(devices):
+                if f"hw:{card_idx}," in dev["name"] and dev["max_output_channels"] > 0:
+                    print(f"[Audio] Using output device {i}: {dev['name']}")
+                    return i
+    except Exception as e:
+        print(f"[Audio] Device scan error: {e}")
+    print("[Audio] WARNING: wm8960 not found, using sounddevice default output")
+    return None
 import ctranslate2
 import sentencepiece as spm
 
@@ -89,7 +112,7 @@ MIC_CHANNELS     = 1
 MIC_BLOCK_SEC    = 0.25
 
 HOLD_DURATION    = 1.0   # seconds — long press threshold
-CONVO_TIMEOUT    = 15.0  # seconds — inactivity → back to IDLE
+CONVO_TIMEOUT    = 10.0  # seconds — inactivity → back to IDLE
 
 ENABLE_TTS = True
 
@@ -355,10 +378,11 @@ def translate(mt: MTModel, text: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # TTS
 # ─────────────────────────────────────────────────────────────────────────────
-def _piper_play(voice, text: str):
+def _piper_play(voice, text: str, out_device=None):
     if hasattr(voice, "synthesize_stream_raw"):
         rate   = voice.config.sample_rate
-        stream = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+        stream = sd.OutputStream(samplerate=rate, channels=1, dtype="int16",
+                                 device=out_device)
         stream.start()
         for audio_bytes in voice.synthesize_stream_raw(text):
             stream.write(np.frombuffer(audio_bytes, dtype=np.int16))
@@ -377,20 +401,20 @@ def _piper_play(voice, text: str):
         with wave.open(out_wav, "rb") as wf:
             data = wf.readframes(wf.getnframes())
         sd.play(np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0,
-                samplerate=rate)
+                samplerate=rate, device=out_device)
         sd.wait()
         return
 
     raise RuntimeError("No supported synthesize method on PiperVoice.")
 
 
-def speak(app: AppState, text: str, lang: str):
+def speak(app: AppState, text: str, lang: str, out_device=None):
     if not ENABLE_TTS or not text:
         return
     voice = app.piper_zh if lang == "zh" else app.piper_en
     if voice:
         try:
-            _piper_play(voice, text)
+            _piper_play(voice, text, out_device=out_device)
             return
         except Exception as e:
             print(f"  [TTS] Piper error: {e}")
@@ -408,8 +432,8 @@ def main():
 
     images = {
         "idle":       _load_image(board, os.path.join(IMGS_DIR, "passive.jpg")),
-        "listening":  _load_image(board, os.path.join(IMGS_DIR, "listening.jpg")),
-        "processing": _load_image(board, os.path.join(IMGS_DIR, "talking.jpg")),
+        "listening":  _load_image(board, os.path.join(IMGS_DIR, "recording.jpg")),
+        "processing": _load_image(board, os.path.join(IMGS_DIR, "playing.jpg")),
     }
 
     if images["idle"]:
@@ -418,7 +442,10 @@ def main():
     else:
         print("[Display] WARNING: idle image missing or failed to load.")
 
-    # ── STEP 2: Load models (HAT already showing image above) ─────────────────
+    # ── STEP 2: Detect audio output device (do this before model load) ────────
+    out_device = _get_sd_device()
+
+    # ── STEP 3: Load models (HAT already showing image above) ─────────────────
     app = init_app()
 
     # ── Shared mutable state ──────────────────────────────────────────────────
@@ -428,6 +455,7 @@ def main():
     last_activity  = [0.0]
     press_time     = [0.0]       # set on button press, read on button release
     stop_recording = threading.Event()
+    aborted        = [False]     # set by timeout to tell recording thread to exit
 
     def set_state(new_state: State):
         state[0] = new_state
@@ -480,6 +508,11 @@ def main():
     def _recording_thread():
         record_until_button(stop_recording)
 
+        # If a timeout aborted us, don't process — just exit the thread.
+        if aborted[0]:
+            aborted[0] = False
+            return
+
         set_state(State.PROCESSING)
 
         # Snapshot direction before any async change
@@ -505,7 +538,7 @@ def main():
         out = translate(mt, text)
         print(f"  [{direction}] {text}\n  →  {out}  [{time.time()-t0:.2f}s]")
 
-        speak(app, out, tgt_lang)
+        speak(app, out, tgt_lang, out_device=out_device)
 
         # Swap direction for the other speaker's turn
         eng_to_cn[0] = not eng_to_cn[0]
@@ -529,9 +562,11 @@ def main():
         while True:
             if state[0] != State.IDLE:
                 if time.time() - last_activity[0] > CONVO_TIMEOUT:
-                    print("\n[TIMEOUT] 15s inactivity — returning to IDLE.")
-                    stop_recording.set()
-                    sleep(0.5)
+                    print("\n[TIMEOUT] 10s inactivity — returning to IDLE.")
+                    aborted[0] = True        # tell any running thread to exit
+                    stop_recording.set()     # unblock record_until_button
+                    sleep(0.5)               # let thread wind down
+                    stop_recording.clear()   # ready for next conversation
                     set_state(State.IDLE)
             sleep(0.1)
 
