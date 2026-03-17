@@ -42,12 +42,12 @@ os.makedirs(DATA_DIR, exist_ok=True)
 REC_FILE      = os.path.join(DATA_DIR, "recorded_voice.wav")
 
 # Vosk — use full models on Pi 5 (not -small); much better accuracy
-VOSK_EN_DIR   = os.path.join(MODELS_DIR, "vosk-model-en-us-0.22")
-VOSK_ZH_DIR   = os.path.join(MODELS_DIR, "vosk-model-cn-0.22")
+VOSK_EN_DIR   = os.path.join(MODELS_DIR, "vosk-en")
+VOSK_ZH_DIR   = os.path.join(MODELS_DIR, "vosk-cn")
 
 # CTranslate2 OPUS-MT models
-CT2_EN_ZH_DIR = os.path.join(MODELS_DIR, "opus-en-zh-ct2")
-CT2_ZH_EN_DIR = os.path.join(MODELS_DIR, "opus-zh-en-ct2")
+CT2_EN_ZH_DIR = os.path.join(MODELS_DIR, "opus-mt-en-zh-ctranslate2")
+CT2_ZH_EN_DIR = os.path.join(MODELS_DIR, "opus-mt-zh-en-ctranslate2")
 
 # Piper TTS — ARM64 binary + ONNX voice files
 # Download: https://github.com/rhasspy/piper/releases  (piper_linux_aarch64.tar.gz)
