@@ -432,8 +432,8 @@ def main():
 
     images = {
         "idle":       _load_image(board, os.path.join(IMGS_DIR, "passive.jpg")),
-        "listening":  _load_image(board, os.path.join(IMGS_DIR, "recording.jpg")),
-        "processing": _load_image(board, os.path.join(IMGS_DIR, "playing.jpg")),
+        "listening":  _load_image(board, os.path.join(IMGS_DIR, "listening.jpg")),
+        "processing": _load_image(board, os.path.join(IMGS_DIR, "talking.jpg")),
     }
 
     if images["idle"]:
