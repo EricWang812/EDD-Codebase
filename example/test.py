@@ -16,7 +16,7 @@ global_image_data = None
 image_filepath = None
 
 # Initialize pygame mixer
-pygame.mixer.init()
+pygame.mixer.init(frequency=48000)
 sound = None  # Global sound variable
 playing = False  # Global variable to track if sound is playing
 
