@@ -9,53 +9,14 @@ aplay -l 2>/dev/null || true
 echo ""
 
 # ── Find wm8960 card index ────────────────────────────────────────────────────
-find_wm8960_card_index() {
-  local idx=""
-
-  # Primary: parse /proc/asound/cards
-  # Format: " 0 [wm8960soundcard]: ..."
-  if [ -r /proc/asound/cards ]; then
-    idx=$(awk '
-      /wm8960soundcard|wm8960/ {
-        gsub(/[^0-9]/, "", $1)
-        if ($1 != "") { print $1; exit }
-      }
-    ' /proc/asound/cards 2>/dev/null || true)
-  fi
-
-  # Fallback: parse aplay -l
-  if [ -z "$idx" ]; then
-    idx=$(aplay -l 2>/dev/null | awk '
-      /wm8960/ {
-        for (i = 1; i <= NF; i++) {
-          if ($i == "card") {
-            x = $(i+1)
-            gsub(/[^0-9]/, "", x)
-            if (x != "") { print x; exit }
-          }
-        }
-      }
-    ' || true)
-  fi
-
-  if [ -n "$idx" ]; then
-    printf '%s\n' "$idx"
-    return 0
-  fi
-  return 1
-}
-
-if card_index=$(find_wm8960_card_index); then
-  echo "Found wm8960 at card index: $card_index"
-else
-  echo "[WARN] Could not detect wm8960 card — defaulting to card 1"
+card_index=$(awk '/wm8960soundcard/ {print $1}' /proc/asound/cards | head -n1)
+# Default to 1 if not found
+if [ -z "$card_index" ]; then
   card_index=1
 fi
+echo "Using sound card index: $card_index"
 
 # ── Export audio env vars for Python ─────────────────────────────────────────
-# WM8960_CARD_INDEX is used by main.py's _find_sd_device() to locate
-# the correct sounddevice device via the "hw:N" pattern — same method
-# the test .sh uses with AUDIODEV=hw:N,0.
 export WM8960_CARD_INDEX="$card_index"
 export WM8960_CARD_NAME="wm8960soundcard"
 export WM8960_HW="hw:${WM8960_CARD_NAME},0"

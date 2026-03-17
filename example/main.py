@@ -9,7 +9,7 @@ Hardware: WhisPlay HAT (Raspberry Pi / Radxa)
   - 10s inactivity timeout = return to IDLE, requires fresh button press
 
 Install deps:
-    pip install vosk ctranslate2 sentencepiece sounddevice numpy piper-tts pillow
+    pip install vosk ctranslate2 sentencepiece sounddevice numpy piper-tts pillow pygame
     sudo apt install espeak-ng libportaudio2 portaudio19-dev
 """
 
@@ -19,6 +19,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import threading
@@ -33,6 +34,7 @@ import sounddevice as sd
 import vosk
 import ctranslate2
 import sentencepiece as spm
+import pygame
 
 try:
     from piper.voice import PiperVoice
@@ -68,6 +70,7 @@ IMGS_DIR   = os.path.join(HERE, "imgs")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 REC_FILE      = os.path.join(DATA_DIR, "recorded_voice.wav")
+TTS_OUT_FILE  = os.path.join(DATA_DIR, "tts_out.wav")
 VOSK_EN_DIR   = os.path.join(MODELS_DIR, "vosk-en")
 VOSK_ZH_DIR   = os.path.join(MODELS_DIR, "vosk-cn")
 CT2_EN_ZH_DIR = os.path.join(MODELS_DIR, "opus-en-zh-ct2")
@@ -112,13 +115,11 @@ class AppState:
     piper_zh: object
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Audio device detection
-# sounddevice ignores ALSA_CONFIG_PATH so we must find the wm8960 device
-# ourselves using the card index that the .sh exports as WM8960_CARD_INDEX.
+# Audio device detection (input only — pygame handles output)
 # ─────────────────────────────────────────────────────────────────────────────
-def _find_sd_device(want_output: bool) -> Optional[int]:
+def _find_sd_input_device() -> Optional[int]:
     """
-    Find the wm8960 sounddevice index for input or output.
+    Find the wm8960 sounddevice index for input (microphone).
     Strategy:
       1. Match 'hw:<WM8960_CARD_INDEX>' in device name  (most reliable)
       2. Match WM8960_CARD_NAME substring in device name
@@ -127,43 +128,49 @@ def _find_sd_device(want_output: bool) -> Optional[int]:
     """
     card_idx  = os.environ.get("WM8960_CARD_INDEX", "").strip()
     card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard").lower()
-    chan_key   = "max_output_channels" if want_output else "max_input_channels"
-    label      = "output" if want_output else "input"
 
     try:
         devices = sd.query_devices()
-
-        if want_output:
-            print("[Audio] Available output devices:")
-            for i, d in enumerate(devices):
-                if d["max_output_channels"] > 0:
-                    print(f"  {i}: {d['name']!r}")
 
         # Strategy 1 — hw:N prefix
         if card_idx.isdigit():
             hw = f"hw:{card_idx}"
             for i, d in enumerate(devices):
-                if hw in d["name"] and d[chan_key] > 0:
-                    print(f"[Audio] {label} device {i}: {d['name']!r}")
+                if hw in d["name"] and d["max_input_channels"] > 0:
+                    print(f"[Audio] input device {i}: {d['name']!r}")
                     return i
 
         # Strategy 2 — card name substring
         for i, d in enumerate(devices):
-            if card_name in d["name"].lower() and d[chan_key] > 0:
-                print(f"[Audio] {label} device {i}: {d['name']!r}")
+            if card_name in d["name"].lower() and d["max_input_channels"] > 0:
+                print(f"[Audio] input device {i}: {d['name']!r}")
                 return i
 
         # Strategy 3 — wm8960 anywhere
         for i, d in enumerate(devices):
-            if "wm8960" in d["name"].lower() and d[chan_key] > 0:
-                print(f"[Audio] {label} device {i}: {d['name']!r}")
+            if "wm8960" in d["name"].lower() and d["max_input_channels"] > 0:
+                print(f"[Audio] input device {i}: {d['name']!r}")
                 return i
 
     except Exception as e:
         print(f"[Audio] Device scan error: {e}")
 
-    print(f"[Audio] WARNING: wm8960 {label} not found — using sounddevice default")
+    print("[Audio] WARNING: wm8960 input not found — using sounddevice default")
     return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Volume
+# ─────────────────────────────────────────────────────────────────────────────
+def _set_speaker_volume(level: str = "90%"):
+    card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard")
+    cmd = ["amixer", "-D", f"hw:{card_name}", "sset", "Speaker", level]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print(f"[Audio] Speaker volume set to {level}")
+    except subprocess.CalledProcessError as e:
+        print(f"[Audio] Could not set speaker volume: {e.stderr.strip()}")
+    except FileNotFoundError:
+        print("[Audio] amixer not found — skipping volume set")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Display helpers
@@ -407,45 +414,32 @@ def translate(mt: MTModel, text: str) -> str:
     return _clean(" ".join(results))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TTS
+# TTS — Piper synthesizes to WAV, pygame.mixer plays it back
 # ─────────────────────────────────────────────────────────────────────────────
-def _piper_play(voice, text: str, out_device=None):
-    if hasattr(voice, "synthesize_stream_raw"):
-        rate   = voice.config.sample_rate
-        stream = sd.OutputStream(samplerate=rate, channels=1, dtype="int16",
-                                 device=out_device)
-        stream.start()
-        for audio_bytes in voice.synthesize_stream_raw(text):
-            stream.write(np.frombuffer(audio_bytes, dtype=np.int16))
-        stream.stop()
-        stream.close()
-        return
+def _piper_play(voice, text: str):
+    """Synthesize with Piper → write WAV → play via pygame.mixer (blocks until done)."""
+    rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
 
-    if hasattr(voice, "synthesize"):
-        out_wav = os.path.join(DATA_DIR, "tts_out.wav")
-        rate    = getattr(getattr(voice, "config", None), "sample_rate", 22050)
-        with wave.open(out_wav, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(rate)
-            voice.synthesize(text, wf)
-        with wave.open(out_wav, "rb") as wf:
-            data = wf.readframes(wf.getnframes())
-        sd.play(np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0,
-                samplerate=rate, device=out_device)
-        sd.wait()
-        return
+    with wave.open(TTS_OUT_FILE, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        voice.synthesize(text, wf)
 
-    raise RuntimeError("No supported synthesize method on PiperVoice.")
+    sound = pygame.mixer.Sound(TTS_OUT_FILE)
+    sound.play()
+    # Block until playback finishes so the next recording doesn't start too early
+    while pygame.mixer.get_busy():
+        sleep(0.05)
 
 
-def speak(app: AppState, text: str, lang: str, out_device=None):
+def speak(app: AppState, text: str, lang: str):
     if not ENABLE_TTS or not text:
         return
     voice = app.piper_zh if lang == "zh" else app.piper_en
     if voice:
         try:
-            _piper_play(voice, text, out_device=out_device)
+            _piper_play(voice, text)
             return
         except Exception as e:
             print(f"  [TTS] Piper error: {e}")
@@ -455,8 +449,11 @@ def speak(app: AppState, text: str, lang: str, out_device=None):
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    # ── STEP 1: Board + idle image FIRST ──────────────────────────────────────
-    # HAT is live and showing the idle screen before the slow model load starts.
+    # ── STEP 1: pygame mixer init ─────────────────────────────────────────────
+    pygame.mixer.init()
+    print("[Audio] pygame mixer initialized.")
+
+    # ── STEP 2: Board + idle image FIRST ──────────────────────────────────────
     board = WhisPlayBoard()
     board.set_backlight(50)
 
@@ -472,27 +469,16 @@ def main():
     else:
         print("[Display] WARNING: idle image missing or failed to load.")
 
-    # ── STEP 2: Detect audio devices ─────────────────────────────────────────
-    out_device = _find_sd_device(want_output=True)
-    in_device  = _find_sd_device(want_output=False)
+    # ── STEP 3: Detect mic input device ──────────────────────────────────────
+    in_device = _find_sd_input_device()
 
-    # ── STEP 3: Set speaker volume via amixer ─────────────────────────────────
-    try:
-        import subprocess
-        card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard")
-        subprocess.run(
-            ["amixer", "-D", f"hw:{card_name}", "sset", "Speaker", "90%"],
-            check=True, capture_output=True
-        )
-        print(f"[Audio] Speaker volume set to 90%")
-    except Exception as e:
-        print(f"[Audio] Could not set speaker volume: {e}")
+    # ── STEP 4: Set speaker volume via amixer ─────────────────────────────────
+    _set_speaker_volume("90%")
 
-    # ── STEP 4: Load models (HAT already showing image above) ─────────────────
+    # ── STEP 5: Load models ───────────────────────────────────────────────────
     app = init_app()
 
     # ── Shared mutable state ──────────────────────────────────────────────────
-    # Single-element lists so all nested closures and threads can write safely.
     state          = [State.IDLE]
     eng_to_cn      = [True]    # True = EN speaker first (EN→ZH)
     last_activity  = [0.0]
@@ -511,18 +497,6 @@ def main():
         update_display(board, new_state, images)
 
     # ── Button callbacks ───────────────────────────────────────────────────────
-    # Driver fires on_button_press on press-down, on_button_release on release.
-    #
-    # IDLE:
-    #   press   → record timestamp
-    #   release → measure hold duration
-    #             ≥ HOLD_DURATION → long press → EN first (EN→ZH)
-    #             <  HOLD_DURATION → short press → ZH first (ZH→EN)
-    #             → transition to LISTENING
-    #
-    # LISTENING:
-    #   press → stop recording (release ignored)
-
     def on_press():
         if state[0] == State.IDLE:
             press_time[0] = time.time()
@@ -556,7 +530,6 @@ def main():
 
         set_state(State.PROCESSING)
 
-        # Snapshot direction now in case it changes on another thread.
         is_en_first = eng_to_cn[0]
         direction   = "EN→ZH" if is_en_first else "ZH→EN"
         vosk_model  = app.vosk_en if is_en_first else app.vosk_zh
@@ -579,10 +552,10 @@ def main():
         out = translate(mt, text)
         print(f"  [{direction}] {text}\n  →  {out}  [{time.time()-t0:.2f}s]")
 
-        speak(app, out, tgt_lang, out_device=out_device)
+        speak(app, out, tgt_lang)
 
         # Swap direction for the other speaker's turn.
-        eng_to_cn[0]    = not eng_to_cn[0]
+        eng_to_cn[0]     = not eng_to_cn[0]
         last_activity[0] = time.time()
 
         stop_recording.clear()
@@ -599,23 +572,22 @@ def main():
     print("        SHORT press (tap and release)        = Chinese speaker first (ZH→EN)")
 
     # ── Main loop — inactivity watchdog ──────────────────────────────────────
-    # After CONVO_TIMEOUT seconds with no activity, kill any running recording
-    # thread and return fully to IDLE — requiring a fresh button press to start.
     try:
         while True:
             if state[0] != State.IDLE:
                 if time.time() - last_activity[0] > CONVO_TIMEOUT:
                     print("\n[TIMEOUT] 10s inactivity — returning to IDLE.")
-                    aborted[0] = True       # signal recording thread to exit
-                    stop_recording.set()    # unblock record_until_button
-                    sleep(0.5)              # let thread wind down
-                    stop_recording.clear()  # ready for next conversation
+                    aborted[0] = True
+                    stop_recording.set()
+                    sleep(0.5)
+                    stop_recording.clear()
                     set_state(State.IDLE)
             sleep(0.1)
 
     except KeyboardInterrupt:
         print("\nExiting ...")
         stop_recording.set()
+        pygame.mixer.quit()
         board.cleanup()
 
 
