@@ -41,13 +41,14 @@ except ImportError:
     PIPER_AVAILABLE = False
     print("[WARN] piper-tts not installed — run: pip install piper-tts")
 
-try:
-    sys.path.append(os.path.abspath("../Driver"))
-    from WhisPlay import WhisPlayBoard
-    WHISPLAY_AVAILABLE = True
-except ImportError:
-    WHISPLAY_AVAILABLE = False
-    print("[WARN] WhisPlay driver not found — running in headless mode")
+# Path is resolved relative to THIS file, not the working directory.
+# This matches how the working demo always finds the driver regardless
+# of where you launch the script from.
+_DRIVER_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Driver")
+)
+sys.path.insert(0, _DRIVER_DIR)
+from WhisPlay import WhisPlayBoard
 
 # ─────────────────────────────────────────────────────────────────────────────
 # State Machine
@@ -151,8 +152,6 @@ def _load_image(board, filepath: str):
 
 def update_display(board, state: State, images: dict):
     """Push the correct image to the LCD for the current state."""
-    if board is None:
-        return
     key = state.name.lower()  # "idle" / "listening" / "processing"
     img = images.get(key)
     if img:
@@ -407,20 +406,18 @@ def main():
     # ── STEP 1: Board + idle image FIRST, before any slow model loading ───────
     # This matches the working demo — the HAT is live and showing a screen
     # immediately at startup, not after a 30-second model load delay.
-    board = None
     images = {}
-    if WHISPLAY_AVAILABLE:
-        board = WhisPlayBoard()
-        board.set_backlight(50)
-        images["idle"]       = _load_image(board, os.path.join(IMGS_DIR, "passive.jpg"))
-        images["listening"]  = _load_image(board, os.path.join(IMGS_DIR, "recording.jpg"))
-        images["processing"] = _load_image(board, os.path.join(IMGS_DIR, "playing.jpg"))
-        # Draw idle image immediately — board is live before models load
-        if images["idle"]:
-            board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, images["idle"])
-            print("[Display] Idle image shown.")
-        else:
-            print("[Display] WARNING: idle image missing or failed to load.")
+    board = WhisPlayBoard()
+    board.set_backlight(50)
+    images["idle"]       = _load_image(board, os.path.join(IMGS_DIR, "passive.jpg"))
+    images["listening"]  = _load_image(board, os.path.join(IMGS_DIR, "recording.jpg"))
+    images["processing"] = _load_image(board, os.path.join(IMGS_DIR, "playing.jpg"))
+    # Draw idle image immediately — board is live before models load
+    if images["idle"]:
+        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, images["idle"])
+        print("[Display] Idle image shown.")
+    else:
+        print("[Display] WARNING: idle image missing or failed to load.")
 
     # ── STEP 2: Load models (slow — HAT already showing image above) ──────────
     app = init_app()
@@ -525,8 +522,7 @@ def main():
         threading.Thread(target=_recording_thread, daemon=True).start()
 
     # ── Register button callback ──────────────────────────────────────────────
-    if board:
-        board.on_button_press(on_button_pressed)
+    board.on_button_press(on_button_pressed)
 
     # ── Confirm idle state in display + console ───────────────────────────────
     # Note: idle image was already drawn at startup above.
@@ -549,8 +545,7 @@ def main():
     except KeyboardInterrupt:
         print("\nExiting ...")
         stop_recording.set()
-        if board:
-            board.cleanup()
+        board.cleanup()
 
 
 if __name__ == "__main__":
