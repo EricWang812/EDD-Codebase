@@ -449,13 +449,13 @@ def speak(app: AppState, text: str, lang: str):
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
+    board = WhisPlayBoard()
+    board.set_backlight(50)
     # ── STEP 1: pygame mixer init ─────────────────────────────────────────────
     pygame.mixer.init()
     print("[Audio] pygame mixer initialized.")
 
     # ── STEP 2: Board + idle image FIRST ──────────────────────────────────────
-    board = WhisPlayBoard()
-    board.set_backlight(50)
 
     images = {
         "idle":       _load_image(board, os.path.join(IMGS_DIR, "passive.jpg")),
