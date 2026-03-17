@@ -22,6 +22,10 @@ export WM8960_CARD_NAME="wm8960soundcard"
 export WM8960_HW="hw:${WM8960_CARD_NAME},0"
 export AUDIODEV="hw:${card_index},0"
 
+# SDL picks up AUDIODEV automatically — this is exactly what makes
+# pygame.mixer work in the test script when launched via this .sh
+export SDL_AUDIODRIVER="alsa"
+
 # ── Write a temporary ALSA config so arecord/aplay CLI tools use wm8960 ──────
 ASOUNDRC_TMP=$(mktemp /tmp/.asoundrc.XXXXXX)
 cleanup() { rm -f "$ASOUNDRC_TMP"; }
@@ -50,6 +54,7 @@ export ONNXRUNTIME_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 
 echo "AUDIODEV=$AUDIODEV"
+echo "SDL_AUDIODRIVER=$SDL_AUDIODRIVER"
 echo "WM8960_CARD_INDEX=$WM8960_CARD_INDEX"
 echo "WM8960_CARD_NAME=$WM8960_CARD_NAME"
 echo "ALSA_CONFIG_PATH=$ALSA_CONFIG_PATH"

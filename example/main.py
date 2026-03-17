@@ -159,20 +159,6 @@ def _find_sd_input_device() -> Optional[int]:
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Volume
-# ─────────────────────────────────────────────────────────────────────────────
-def _set_speaker_volume(level: str = "90%"):
-    card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard")
-    cmd = ["amixer", "-D", f"hw:{card_name}", "sset", "Speaker", level]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"[Audio] Speaker volume set to {level}")
-    except subprocess.CalledProcessError as e:
-        print(f"[Audio] Could not set speaker volume: {e.stderr.strip()}")
-    except FileNotFoundError:
-        print("[Audio] amixer not found — skipping volume set")
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Display helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_image(board, filepath: str):
@@ -414,50 +400,44 @@ def translate(mt: MTModel, text: str) -> str:
     return _clean(" ".join(results))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TTS — Piper synthesizes to WAV, pygame.mixer plays it back
+# TTS
+# Piper synthesizes to a WAV file, then pygame.mixer.Sound plays it back —
+# identical to how the test script does: sound = pygame.mixer.Sound(file); sound.play()
 # ─────────────────────────────────────────────────────────────────────────────
-def _piper_play(voice, text: str):
-    """Synthesize with Piper → write WAV → play via pygame.mixer (blocks until done)."""
-    rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
-
-    with wave.open(TTS_OUT_FILE, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(rate)
-        voice.synthesize(text, wf)
-
-    sound = pygame.mixer.Sound(TTS_OUT_FILE)
-    sound.play()
-    # Block until playback finishes so the next recording doesn't start too early
-    while pygame.mixer.get_busy():
-        sleep(0.05)
-
-
 def speak(app: AppState, text: str, lang: str):
     if not ENABLE_TTS or not text:
         return
+
     voice = app.piper_zh if lang == "zh" else app.piper_en
-    if voice:
-        try:
-            _piper_play(voice, text)
-            return
-        except Exception as e:
-            print(f"  [TTS] Piper error: {e}")
-    print(f"  [TTS] No TTS available for lang={lang}")
+    if not voice:
+        print(f"  [TTS] No voice loaded for lang={lang}")
+        return
+
+    try:
+        rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
+        with wave.open(TTS_OUT_FILE, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            voice.synthesize(text, wf)
+
+        sound = pygame.mixer.Sound(TTS_OUT_FILE)
+        sound.play()
+        while pygame.mixer.get_busy():
+            sleep(0.1)
+
+    except Exception as e:
+        print(f"  [TTS] Error: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    # ── STEP 1: pygame mixer init ─────────────────────────────────────────────
-    card_idx = os.environ.get("WM8960_CARD_INDEX", "1").strip()
-    os.environ["SDL_AUDIODRIVER"] = "alsa"
-    os.environ["AUDIODEV"] = f"hw:{card_idx},0"
-    print(f"[Audio] pygame will use AUDIODEV={os.environ['AUDIODEV']}")
+    # ── STEP 1: pygame mixer — no args, identical to the test script ──────────
     pygame.mixer.init()
     print("[Audio] pygame mixer initialized.")
 
-    # ── STEP 2: Board + idle image FIRST ──────────────────────────────────────
+    # ── STEP 2: Board + idle image ────────────────────────────────────────────
     board = WhisPlayBoard()
     board.set_backlight(50)
 
@@ -476,19 +456,27 @@ def main():
     # ── STEP 3: Detect mic input device ──────────────────────────────────────
     in_device = _find_sd_input_device()
 
-    # ── STEP 4: Set speaker volume via amixer ─────────────────────────────────
-    _set_speaker_volume("90%")
+    # ── STEP 4: Set speaker volume — identical to the test script ─────────────
+    card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard")
+    try:
+        subprocess.run(
+            ["amixer", "-D", f"hw:{card_name}", "sset", "Speaker", "121"],
+            check=True, capture_output=True, text=True
+        )
+        print("[Audio] Speaker volume set to 121")
+    except Exception as e:
+        print(f"[Audio] Could not set speaker volume: {e}")
 
     # ── STEP 5: Load models ───────────────────────────────────────────────────
     app = init_app()
 
     # ── Shared mutable state ──────────────────────────────────────────────────
     state          = [State.IDLE]
-    eng_to_cn      = [True]    # True = EN speaker first (EN→ZH)
+    eng_to_cn      = [True]
     last_activity  = [0.0]
-    press_time     = [0.0]     # wall-clock time of button press-down
+    press_time     = [0.0]
     stop_recording = threading.Event()
-    aborted        = [False]   # set True by timeout so recording thread exits cleanly
+    aborted        = [False]
 
     def set_state(new_state: State):
         state[0] = new_state
@@ -500,7 +488,7 @@ def main():
         print(f"\n[STATE] {label}")
         update_display(board, new_state, images)
 
-    # ── Button callbacks ───────────────────────────────────────────────────────
+    # ── Button callbacks ──────────────────────────────────────────────────────
     def on_press():
         if state[0] == State.IDLE:
             press_time[0] = time.time()
@@ -527,7 +515,6 @@ def main():
     def _recording_thread():
         record_until_button(stop_recording, in_device=in_device)
 
-        # Timeout fired while we were recording — exit without processing.
         if aborted[0]:
             aborted[0] = False
             return
@@ -558,7 +545,6 @@ def main():
 
         speak(app, out, tgt_lang)
 
-        # Swap direction for the other speaker's turn.
         eng_to_cn[0]     = not eng_to_cn[0]
         last_activity[0] = time.time()
 
