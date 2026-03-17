@@ -6,11 +6,11 @@ Hardware: WhisPlay HAT (Raspberry Pi / Radxa)
   - Button long press  (≥1s) = start with English speaker first (EN→ZH)
   - Button short press (<1s) = start with Chinese speaker first (ZH→EN)
   - Press again while recording = stop → translate → speak → swap sides
-  - 15s inactivity timeout = return to IDLE
+  - 10s inactivity timeout = return to IDLE, requires fresh button press
 
 Install deps:
     pip install vosk ctranslate2 sentencepiece sounddevice numpy piper-tts pillow
-    sudo apt install espeak-ng
+    sudo apt install espeak-ng libportaudio2 portaudio19-dev
 """
 
 from __future__ import annotations
@@ -31,29 +31,6 @@ from typing import List, Optional
 import numpy as np
 import sounddevice as sd
 import vosk
-
-def _get_sd_device():
-    """Find the wm8960 soundcard device index for sounddevice.
-    Reads WM8960_CARD_NAME env var set by the .sh launcher, then falls back
-    to scanning sounddevice's device list directly."""
-    card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard").lower()
-    try:
-        devices = sd.query_devices()
-        for i, dev in enumerate(devices):
-            if card_name in dev["name"].lower() and dev["max_output_channels"] > 0:
-                print(f"[Audio] Using output device {i}: {dev['name']}")
-                return i
-        # Fallback: try card index from env
-        card_idx = os.environ.get("WM8960_CARD_INDEX", "")
-        if card_idx.isdigit():
-            for i, dev in enumerate(devices):
-                if f"hw:{card_idx}," in dev["name"] and dev["max_output_channels"] > 0:
-                    print(f"[Audio] Using output device {i}: {dev['name']}")
-                    return i
-    except Exception as e:
-        print(f"[Audio] Device scan error: {e}")
-    print("[Audio] WARNING: wm8960 not found, using sounddevice default output")
-    return None
 import ctranslate2
 import sentencepiece as spm
 
@@ -64,8 +41,8 @@ except ImportError:
     PIPER_AVAILABLE = False
     print("[WARN] piper-tts not installed — run: pip install piper-tts")
 
-# Resolve Driver path relative to THIS file, not the working directory.
-# This matches the working demo and works regardless of where you launch from.
+# Resolve Driver path relative to THIS file so it works regardless of
+# what directory you launch the script from.
 _DRIVER_DIR = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Driver")
 )
@@ -111,8 +88,8 @@ MIC_SAMPLE_RATE  = 16_000
 MIC_CHANNELS     = 1
 MIC_BLOCK_SEC    = 0.25
 
-HOLD_DURATION    = 1.0   # seconds — long press threshold
-CONVO_TIMEOUT    = 10.0  # seconds — inactivity → back to IDLE
+HOLD_DURATION  = 1.0   # seconds — long press threshold
+CONVO_TIMEOUT  = 10.0  # seconds — inactivity → back to IDLE
 
 ENABLE_TTS = True
 
@@ -135,10 +112,64 @@ class AppState:
     piper_zh: object
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Audio device detection
+# sounddevice ignores ALSA_CONFIG_PATH so we must find the wm8960 device
+# ourselves using the card index that the .sh exports as WM8960_CARD_INDEX.
+# ─────────────────────────────────────────────────────────────────────────────
+def _find_sd_device(want_output: bool) -> Optional[int]:
+    """
+    Find the wm8960 sounddevice index for input or output.
+    Strategy:
+      1. Match 'hw:<WM8960_CARD_INDEX>' in device name  (most reliable)
+      2. Match WM8960_CARD_NAME substring in device name
+      3. Match 'wm8960' anywhere in device name
+      4. Return None (sounddevice default)
+    """
+    card_idx  = os.environ.get("WM8960_CARD_INDEX", "").strip()
+    card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard").lower()
+    chan_key   = "max_output_channels" if want_output else "max_input_channels"
+    label      = "output" if want_output else "input"
+
+    try:
+        devices = sd.query_devices()
+
+        if want_output:
+            print("[Audio] Available output devices:")
+            for i, d in enumerate(devices):
+                if d["max_output_channels"] > 0:
+                    print(f"  {i}: {d['name']!r}")
+
+        # Strategy 1 — hw:N prefix
+        if card_idx.isdigit():
+            hw = f"hw:{card_idx}"
+            for i, d in enumerate(devices):
+                if hw in d["name"] and d[chan_key] > 0:
+                    print(f"[Audio] {label} device {i}: {d['name']!r}")
+                    return i
+
+        # Strategy 2 — card name substring
+        for i, d in enumerate(devices):
+            if card_name in d["name"].lower() and d[chan_key] > 0:
+                print(f"[Audio] {label} device {i}: {d['name']!r}")
+                return i
+
+        # Strategy 3 — wm8960 anywhere
+        for i, d in enumerate(devices):
+            if "wm8960" in d["name"].lower() and d[chan_key] > 0:
+                print(f"[Audio] {label} device {i}: {d['name']!r}")
+                return i
+
+    except Exception as e:
+        print(f"[Audio] Device scan error: {e}")
+
+    print(f"[Audio] WARNING: wm8960 {label} not found — using sounddevice default")
+    return None
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Display helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_image(board, filepath: str):
-    """Load an image as RGB565 for the WhisPlay LCD, with aspect-ratio crop."""
+    """Load an image as RGB565 for the WhisPlay LCD with aspect-ratio crop."""
     try:
         from PIL import Image
         img = Image.open(filepath).convert("RGB")
@@ -171,7 +202,6 @@ def _load_image(board, filepath: str):
 
 
 def update_display(board, state: State, images: dict):
-    """Push the correct image to the LCD for the current state."""
     key = state.name.lower()  # "idle" / "listening" / "processing"
     img = images.get(key)
     if img:
@@ -248,7 +278,7 @@ def _normalize_audio(audio: np.ndarray) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 # Recording
 # ─────────────────────────────────────────────────────────────────────────────
-def record_until_button(stop_event) -> str:
+def record_until_button(stop_event, in_device=None) -> str:
     MAX_RECORD_SEC = 30
     block_size = int(MIC_SAMPLE_RATE * MIC_BLOCK_SEC)
     max_blocks = int(MAX_RECORD_SEC / MIC_BLOCK_SEC)
@@ -256,7 +286,8 @@ def record_until_button(stop_event) -> str:
 
     print("  [MIC] Recording — press button to stop ...")
     with sd.InputStream(samplerate=MIC_SAMPLE_RATE, channels=MIC_CHANNELS,
-                        dtype="int16", blocksize=block_size) as stream:
+                        dtype="int16", blocksize=block_size,
+                        device=in_device) as stream:
         for _ in range(max_blocks):
             if stop_event.is_set():
                 break
@@ -424,9 +455,8 @@ def speak(app: AppState, text: str, lang: str, out_device=None):
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    # ── STEP 1: Board + idle image FIRST, before any slow model loading ───────
-    # The HAT is live and showing the idle screen immediately at startup,
-    # before the 30+ second model load begins. Matches the working demo.
+    # ── STEP 1: Board + idle image FIRST ──────────────────────────────────────
+    # HAT is live and showing the idle screen before the slow model load starts.
     board = WhisPlayBoard()
     board.set_backlight(50)
 
@@ -442,20 +472,33 @@ def main():
     else:
         print("[Display] WARNING: idle image missing or failed to load.")
 
-    # ── STEP 2: Detect audio output device (do this before model load) ────────
-    out_device = _get_sd_device()
+    # ── STEP 2: Detect audio devices ─────────────────────────────────────────
+    out_device = _find_sd_device(want_output=True)
+    in_device  = _find_sd_device(want_output=False)
 
-    # ── STEP 3: Load models (HAT already showing image above) ─────────────────
+    # ── STEP 3: Set speaker volume via amixer ─────────────────────────────────
+    try:
+        import subprocess
+        card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard")
+        subprocess.run(
+            ["amixer", "-D", f"hw:{card_name}", "sset", "Speaker", "90%"],
+            check=True, capture_output=True
+        )
+        print(f"[Audio] Speaker volume set to 90%")
+    except Exception as e:
+        print(f"[Audio] Could not set speaker volume: {e}")
+
+    # ── STEP 4: Load models (HAT already showing image above) ─────────────────
     app = init_app()
 
     # ── Shared mutable state ──────────────────────────────────────────────────
-    # Single-element lists so nested closures and threads can write them safely.
+    # Single-element lists so all nested closures and threads can write safely.
     state          = [State.IDLE]
-    eng_to_cn      = [True]      # True = EN speaker first (EN→ZH)
+    eng_to_cn      = [True]    # True = EN speaker first (EN→ZH)
     last_activity  = [0.0]
-    press_time     = [0.0]       # set on button press, read on button release
+    press_time     = [0.0]     # wall-clock time of button press-down
     stop_recording = threading.Event()
-    aborted        = [False]     # set by timeout to tell recording thread to exit
+    aborted        = [False]   # set True by timeout so recording thread exits cleanly
 
     def set_state(new_state: State):
         state[0] = new_state
@@ -468,23 +511,21 @@ def main():
         update_display(board, new_state, images)
 
     # ── Button callbacks ───────────────────────────────────────────────────────
-    # The WhisPlay driver DOES support both on_button_press and on_button_release
-    # (confirmed from driver source). Use both for accurate long/short detection.
+    # Driver fires on_button_press on press-down, on_button_release on release.
     #
-    # IDLE state:
-    #   on_press  → record timestamp
-    #   on_release → measure duration:
-    #       ≥ HOLD_DURATION → long press → EN first (EN→ZH)
-    #       <  HOLD_DURATION → short press → ZH first (ZH→EN)
-    #       → start recording
+    # IDLE:
+    #   press   → record timestamp
+    #   release → measure hold duration
+    #             ≥ HOLD_DURATION → long press → EN first (EN→ZH)
+    #             <  HOLD_DURATION → short press → ZH first (ZH→EN)
+    #             → transition to LISTENING
     #
-    # LISTENING state:
-    #   on_press → stop recording (release not needed here)
+    # LISTENING:
+    #   press → stop recording (release ignored)
 
     def on_press():
         if state[0] == State.IDLE:
             press_time[0] = time.time()
-
         elif state[0] == State.LISTENING:
             print("[BTN] Press → stopping recording")
             stop_recording.set()
@@ -506,21 +547,21 @@ def main():
 
     # ── Recording + processing thread ────────────────────────────────────────
     def _recording_thread():
-        record_until_button(stop_recording)
+        record_until_button(stop_recording, in_device=in_device)
 
-        # If a timeout aborted us, don't process — just exit the thread.
+        # Timeout fired while we were recording — exit without processing.
         if aborted[0]:
             aborted[0] = False
             return
 
         set_state(State.PROCESSING)
 
-        # Snapshot direction before any async change
+        # Snapshot direction now in case it changes on another thread.
         is_en_first = eng_to_cn[0]
-        direction  = "EN→ZH" if is_en_first else "ZH→EN"
-        vosk_model = app.vosk_en if is_en_first else app.vosk_zh
-        mt         = app.en_zh   if is_en_first else app.zh_en
-        tgt_lang   = "zh"        if is_en_first else "en"
+        direction   = "EN→ZH" if is_en_first else "ZH→EN"
+        vosk_model  = app.vosk_en if is_en_first else app.vosk_zh
+        mt          = app.en_zh   if is_en_first else app.zh_en
+        tgt_lang    = "zh"        if is_en_first else "en"
 
         raw  = _transcribe_wav(vosk_model, REC_FILE)
         text = _dedup_stt(raw)
@@ -540,33 +581,35 @@ def main():
 
         speak(app, out, tgt_lang, out_device=out_device)
 
-        # Swap direction for the other speaker's turn
-        eng_to_cn[0] = not eng_to_cn[0]
+        # Swap direction for the other speaker's turn.
+        eng_to_cn[0]    = not eng_to_cn[0]
         last_activity[0] = time.time()
 
         stop_recording.clear()
         set_state(State.LISTENING)
         threading.Thread(target=_recording_thread, daemon=True).start()
 
-    # ── Register both button callbacks ────────────────────────────────────────
+    # ── Register button callbacks ─────────────────────────────────────────────
     board.on_button_press(on_press)
     board.on_button_release(on_release)
 
-    # ── Confirm idle state ────────────────────────────────────────────────────
+    # ── Show idle state ───────────────────────────────────────────────────────
     set_state(State.IDLE)
     print("Button: LONG press  (hold ≥1s then release) = English speaker first (EN→ZH)")
     print("        SHORT press (tap and release)        = Chinese speaker first (ZH→EN)")
 
     # ── Main loop — inactivity watchdog ──────────────────────────────────────
+    # After CONVO_TIMEOUT seconds with no activity, kill any running recording
+    # thread and return fully to IDLE — requiring a fresh button press to start.
     try:
         while True:
             if state[0] != State.IDLE:
                 if time.time() - last_activity[0] > CONVO_TIMEOUT:
                     print("\n[TIMEOUT] 10s inactivity — returning to IDLE.")
-                    aborted[0] = True        # tell any running thread to exit
-                    stop_recording.set()     # unblock record_until_button
-                    sleep(0.5)               # let thread wind down
-                    stop_recording.clear()   # ready for next conversation
+                    aborted[0] = True       # signal recording thread to exit
+                    stop_recording.set()    # unblock record_until_button
+                    sleep(0.5)              # let thread wind down
+                    stop_recording.clear()  # ready for next conversation
                     set_state(State.IDLE)
             sleep(0.1)
 
