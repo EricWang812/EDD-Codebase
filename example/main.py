@@ -422,6 +422,7 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
             wf.setframerate(rate)
             voice.synthesize(text, wf)
         print(f"[TTS] running: aplay -D {hw_device} -r {rate} -f S16_LE -c 1 {TTS_OUT_FILE}")
+        print(f"[TTS] WAV file exists: {os.path.exists(TTS_OUT_FILE)}, size: {os.path.getsize(TTS_OUT_FILE) if os.path.exists(TTS_OUT_FILE) else 'N/A'}")
         # Play with aplay pointing directly at the wm8960 hw device
         subprocess.run(
                             ["aplay", "-D", hw_device, "-r", str(rate), "-f", "S16_LE", "-c", "1", TTS_OUT_FILE],
