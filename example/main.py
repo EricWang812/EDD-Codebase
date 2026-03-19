@@ -3,9 +3,9 @@ WhisPlay HAT Translator — EN <-> ZH
 Vosk STT  +  CTranslate2 OPUS MT  +  Piper TTS
 
 Hardware: WhisPlay HAT (Raspberry Pi / Radxa)
-  - Button long press  (≥1s) = start with English speaker first (EN→ZH)
-  - Button short press (<1s) = start with Chinese speaker first (ZH→EN)
-  - Press again while recording = stop → translate → speak → swap sides
+  - Button long press  (>=1s) = start with English speaker first (EN->ZH)
+  - Button short press (<1s) = start with Chinese speaker first (ZH->EN)
+  - Press again while recording = stop -> translate -> speak -> swap sides
   - 10s inactivity timeout = return to IDLE, requires fresh button press
 
 Install deps:
@@ -50,17 +50,17 @@ _DRIVER_DIR = os.path.abspath(
 sys.path.insert(0, _DRIVER_DIR)
 from WhisPlay import WhisPlayBoard
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # State Machine
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 class State(Enum):
     IDLE       = 0
     LISTENING  = 1
     PROCESSING = 2
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Paths
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 HERE       = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(HERE, "models")
 DATA_DIR   = os.path.join(HERE, "data")
@@ -77,9 +77,9 @@ CT2_ZH_EN_DIR = os.path.join(MODELS_DIR, "opus-zh-en-ct2")
 VOICE_EN      = os.path.join(VOICES_DIR, "en_US-lessac-low.onnx")
 VOICE_ZH      = os.path.join(VOICES_DIR, "zh_CN-huayan-x_low.onnx")
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Settings
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 CT2_COMPUTE_TYPE       = "int8"
 CT2_BEAM_SIZE          = 2
 CT2_MAX_DECODING_LEN   = 256
@@ -91,13 +91,13 @@ MIC_CHANNELS     = 1
 MIC_BLOCK_SEC    = 0.25
 
 HOLD_DURATION  = 1.0   # seconds — long press threshold
-CONVO_TIMEOUT  = 10.0  # seconds — inactivity → back to IDLE
+CONVO_TIMEOUT  = 10.0  # seconds — inactivity -> back to IDLE
 
 ENABLE_TTS = True
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Data classes
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 @dataclass
 class MTModel:
     translator: ctranslate2.Translator
@@ -113,17 +113,14 @@ class AppState:
     piper_en: object
     piper_zh: object
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Audio device detection (input only — aplay handles output)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def _find_sd_input_device() -> Optional[int]:
     """
     Find the wm8960 sounddevice index for input (microphone).
-    Strategy:
-      1. Match 'hw:<WM8960_CARD_INDEX>' in device name  (most reliable)
-      2. Match WM8960_CARD_NAME substring in device name
-      3. Match 'wm8960' anywhere in device name
-      4. Return None (sounddevice default)
+    Tries multiple strategies including card index, known name variants,
+    and simple-card fallback.
     """
     card_idx  = os.environ.get("WM8960_CARD_INDEX", "").strip()
     card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard").lower()
@@ -151,15 +148,28 @@ def _find_sd_input_device() -> Optional[int]:
                 print(f"[Audio] input device {i}: {d['name']!r}")
                 return i
 
+        # Strategy 4 — card index in name (e.g. ":2")
+        if card_idx.isdigit():
+            for i, d in enumerate(devices):
+                if f":{card_idx}" in d["name"] and d["max_input_channels"] > 0:
+                    print(f"[Audio] input device {i}: {d['name']!r}")
+                    return i
+
+        # Strategy 5 — simple-card fallback (common on Pi with wm8960)
+        for i, d in enumerate(devices):
+            if "simple-card" in d["name"].lower() and d["max_input_channels"] > 0:
+                print(f"[Audio] input device {i}: {d['name']!r}")
+                return i
+
     except Exception as e:
         print(f"[Audio] Device scan error: {e}")
 
     print("[Audio] WARNING: wm8960 input not found — using sounddevice default")
     return None
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Display helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def _load_image(board, filepath: str):
     """Load an image as RGB565 for the WhisPlay LCD with aspect-ratio crop."""
     try:
@@ -199,9 +209,9 @@ def update_display(board, state: State, images: dict):
     if img:
         board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Model loading
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def _load_ct2(model_dir: str) -> MTModel:
     for f in ("model.bin", "source.spm", "target.spm"):
         p = os.path.join(model_dir, f)
@@ -255,9 +265,9 @@ def init_app() -> AppState:
     print("\nReady.\n")
     return AppState(vosk_en, vosk_zh, en_zh, zh_en, piper_en, piper_zh)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Audio pre-processing
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def _normalize_audio(audio: np.ndarray) -> np.ndarray:
     peak = np.abs(audio.astype(np.float32)).max()
     if peak < 1:
@@ -267,9 +277,9 @@ def _normalize_audio(audio: np.ndarray) -> np.ndarray:
         return audio
     return np.clip(audio.astype(np.float32) * scale, -32768, 32767).astype(np.int16)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Recording
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def record_until_button(stop_event, in_device=None) -> str:
     MAX_RECORD_SEC = 30
     block_size = int(MIC_SAMPLE_RATE * MIC_BLOCK_SEC)
@@ -295,9 +305,9 @@ def record_until_button(stop_event, in_device=None) -> str:
         wf.writeframes(audio.tobytes())
     return REC_FILE
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # STT
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 _FILLER_RE = re.compile(r'\b(uh+|um+|hmm+|huh|mm+|ah+|er+)\b', re.IGNORECASE)
 
 def _strip_fillers(text: str) -> str:
@@ -366,9 +376,9 @@ def _dedup_stt(text: str) -> str:
             deduped.append(w)
     return " ".join(deduped)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Translation
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def _split_sentences(text: str) -> List[str]:
     parts = re.split(r'(?<=[。！？；.!?;])\s*', text)
     return [p.strip() for p in parts if p.strip()]
@@ -398,12 +408,11 @@ def translate(mt: MTModel, text: str) -> str:
         results.append(mt.sp_tgt.decode(out).strip())
     return _clean(" ".join(results))
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # TTS
-# Piper synthesizes to a WAV file, then aplay plays it back directly on the
-# wm8960 card — no pygame, no SDL, no device guessing.
-# aplay -D hw:<card>,0 is the same device the .sh already verified works.
-# ─────────────────────────────────────────────────────────────────────────────
+# Piper synthesizes raw PCM via synthesize_stream_raw(), written manually to
+# a WAV file, then aplay plays it back directly on the wm8960 card.
+# -----------------------------------------------------------------------------
 def speak(app: AppState, text: str, lang: str, hw_device: str):
     if not ENABLE_TTS or not text:
         return
@@ -413,34 +422,48 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
         print(f"  [TTS] No voice loaded for lang={lang}")
         return
 
+    print(f"  [TTS] lang={lang}, text={text!r}")
+
     try:
-        # Synthesize to WAV
+        # Get sample rate from voice config
         rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
+
+        # Synthesize raw PCM bytes using stream API
+        audio_stream = voice.synthesize_stream_raw(text)
+        audio_data = b"".join(audio_stream)
+
+        if not audio_data:
+            print("  [TTS] WARNING: synthesize_stream_raw returned no audio data")
+            return
+
+        print(f"  [TTS] Synthesized {len(audio_data)} bytes at {rate}Hz")
+
+        # Write to WAV file manually
         with wave.open(TTS_OUT_FILE, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(rate)
-            voice.synthesize(text, wf)
-        print(f"[TTS] lang={lang}, text={text!r}")
-        print(f"[TTS] voice object: {voice}")
-        print(f"[TTS] running: aplay -D {hw_device} -r {rate} -f S16_LE -c 1 {TTS_OUT_FILE}")
-        print(f"[TTS] WAV file exists: {os.path.exists(TTS_OUT_FILE)}, size: {os.path.getsize(TTS_OUT_FILE) if os.path.exists(TTS_OUT_FILE) else 'N/A'}")
-        # Play with aplay pointing directly at the wm8960 hw device
+            wf.writeframes(audio_data)
+
+        print(f"  [TTS] WAV written: {os.path.getsize(TTS_OUT_FILE)} bytes")
+
+        # Play with aplay
+        print(f"  [TTS] running: aplay -D {hw_device} -r {rate} -f S16_LE -c 1 {TTS_OUT_FILE}")
         subprocess.run(
-                            ["aplay", "-D", hw_device, "-r", str(rate), "-f", "S16_LE", "-c", "1", TTS_OUT_FILE],
-                            check=True
-                        )
+            ["aplay", "-D", hw_device, "-r", str(rate), "-f", "S16_LE", "-c", "1", TTS_OUT_FILE],
+            check=True
+        )
 
     except subprocess.CalledProcessError as e:
         print(f"  [TTS] aplay error: {e}")
     except Exception as e:
         print(f"  [TTS] Error: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def main():
-    # ── STEP 1: Board + idle image ────────────────────────────────────────────
+    # -- STEP 1: Board + idle image --------------------------------------------
     board = WhisPlayBoard()
     board.set_backlight(50)
 
@@ -456,18 +479,15 @@ def main():
     else:
         print("[Display] WARNING: idle image missing or failed to load.")
 
-    # ── STEP 2: Resolve hw device string from env (set by .sh) ───────────────
+    # -- STEP 2: Resolve hw device string from env (set by .sh) ---------------
     card_index = os.environ.get("WM8960_CARD_INDEX", "1").strip()
-    hw_device = f"plughw:{card_index},0"
-
-    
-
+    hw_device  = f"plughw:{card_index},0"
     print(f"[Audio] output hw device: {hw_device}")
 
-    # ── STEP 3: Detect mic input device ──────────────────────────────────────
+    # -- STEP 3: Detect mic input device ---------------------------------------
     in_device = _find_sd_input_device()
 
-    # ── STEP 4: Set speaker volume ────────────────────────────────────────────
+    # -- STEP 4: Set speaker volume --------------------------------------------
     card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard")
     try:
         subprocess.run(
@@ -478,10 +498,10 @@ def main():
     except Exception as e:
         print(f"[Audio] Could not set speaker volume: {e}")
 
-    # ── STEP 5: Load models ───────────────────────────────────────────────────
+    # -- STEP 5: Load models ---------------------------------------------------
     app = init_app()
 
-    # ── Shared mutable state ──────────────────────────────────────────────────
+    # -- Shared mutable state --------------------------------------------------
     state          = [State.IDLE]
     eng_to_cn      = [True]
     last_activity  = [0.0]
@@ -499,12 +519,12 @@ def main():
         print(f"\n[STATE] {label}")
         update_display(board, new_state, images)
 
-    # ── Button callbacks ──────────────────────────────────────────────────────
+    # -- Button callbacks ------------------------------------------------------
     def on_press():
         if state[0] == State.IDLE:
             press_time[0] = time.time()
         elif state[0] == State.LISTENING:
-            print("[BTN] Press → stopping recording")
+            print("[BTN] Press -> stopping recording")
             stop_recording.set()
 
     def on_release():
@@ -512,17 +532,17 @@ def main():
             duration = time.time() - press_time[0]
             if duration >= HOLD_DURATION:
                 eng_to_cn[0] = True
-                print(f"[BTN] Long press ({duration:.2f}s) → English first (EN→ZH)")
+                print(f"[BTN] Long press ({duration:.2f}s) -> English first (EN->ZH)")
             else:
                 eng_to_cn[0] = False
-                print(f"[BTN] Short press ({duration:.2f}s) → Chinese first (ZH→EN)")
+                print(f"[BTN] Short press ({duration:.2f}s) -> Chinese first (ZH->EN)")
 
             last_activity[0] = time.time()
             stop_recording.clear()
             set_state(State.LISTENING)
             threading.Thread(target=_recording_thread, daemon=True).start()
 
-    # ── Recording + processing thread ────────────────────────────────────────
+    # -- Recording + processing thread -----------------------------------------
     def _recording_thread():
         record_until_button(stop_recording, in_device=in_device)
 
@@ -533,7 +553,7 @@ def main():
         set_state(State.PROCESSING)
 
         is_en_first = eng_to_cn[0]
-        direction   = "EN→ZH" if is_en_first else "ZH→EN"
+        direction   = "EN->ZH" if is_en_first else "ZH->EN"
         vosk_model  = app.vosk_en if is_en_first else app.vosk_zh
         mt          = app.en_zh   if is_en_first else app.zh_en
         tgt_lang    = "zh"        if is_en_first else "en"
@@ -552,7 +572,7 @@ def main():
 
         t0  = time.time()
         out = translate(mt, text)
-        print(f"  [{direction}] {text}\n  →  {out}  [{time.time()-t0:.2f}s]")
+        print(f"  [{direction}] {text}\n  ->  {out}  [{time.time()-t0:.2f}s]")
 
         speak(app, out, tgt_lang, hw_device)
 
@@ -563,16 +583,16 @@ def main():
         set_state(State.LISTENING)
         threading.Thread(target=_recording_thread, daemon=True).start()
 
-    # ── Register button callbacks ─────────────────────────────────────────────
+    # -- Register button callbacks ---------------------------------------------
     board.on_button_press(on_press)
     board.on_button_release(on_release)
 
-    # ── Show idle state ───────────────────────────────────────────────────────
+    # -- Show idle state -------------------------------------------------------
     set_state(State.IDLE)
-    print("Button: LONG press  (hold ≥1s then release) = English speaker first (EN→ZH)")
-    print("        SHORT press (tap and release)        = Chinese speaker first (ZH→EN)")
+    print("Button: LONG press  (hold >=1s then release) = English speaker first (EN->ZH)")
+    print("        SHORT press (tap and release)        = Chinese speaker first (ZH->EN)")
 
-    # ── Main loop — inactivity watchdog ──────────────────────────────────────
+    # -- Main loop — inactivity watchdog ---------------------------------------
     try:
         while True:
             if state[0] != State.IDLE:
