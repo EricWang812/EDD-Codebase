@@ -444,7 +444,7 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
             wf.setsampwidth(2)
             wf.setframerate(rate)
             wf.writeframes(audio_data)
-
+        print(f"  [TTS] Piper methods: {[m for m in dir(voice) if not m.startswith('_')]}")
         print(f"  [TTS] WAV written: {os.path.getsize(TTS_OUT_FILE)} bytes")
 
         # Play with aplay
