@@ -421,7 +421,7 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
             wf.setsampwidth(2)
             wf.setframerate(rate)
             voice.synthesize(text, wf)
-
+        print(f"[TTS] running: aplay -D {hw_device} -r {rate} -f S16_LE -c 1 {TTS_OUT_FILE}")
         # Play with aplay pointing directly at the wm8960 hw device
         subprocess.run(
                             ["aplay", "-D", hw_device, "-r", str(rate), "-f", "S16_LE", "-c", "1", TTS_OUT_FILE],
@@ -456,6 +456,8 @@ def main():
     # ── STEP 2: Resolve hw device string from env (set by .sh) ───────────────
     card_index = os.environ.get("WM8960_CARD_INDEX", "1").strip()
     hw_device = f"plughw:{card_index},0"
+
+    
 
     print(f"[Audio] output hw device: {hw_device}")
 
