@@ -410,8 +410,8 @@ def translate(mt: MTModel, text: str) -> str:
 
 # -----------------------------------------------------------------------------
 # TTS
-# Piper synthesizes raw PCM via synthesize_stream_raw(), written manually to
-# a WAV file, then aplay plays it back directly on the wm8960 card.
+# Piper synthesizes to a WAV file via synthesize_wav(), then aplay plays it
+# back directly on the wm8960 card.
 # -----------------------------------------------------------------------------
 def speak(app: AppState, text: str, lang: str, hw_device: str):
     if not ENABLE_TTS or not text:
@@ -425,30 +425,28 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
     print(f"  [TTS] lang={lang}, text={text!r}")
 
     try:
-        # Get sample rate from voice config
-        rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
-        print(f"  [TTS] Piper methods: {[m for m in dir(voice) if not m.startswith('_')]}")
+        # synthesize_wav() writes a complete WAV to a file-like object
+        buf = io.BytesIO()
+        voice.synthesize_wav(text, buf)
+        wav_bytes = buf.getvalue()
 
-        # Synthesize raw PCM bytes using stream API
-        audio_stream = voice.synthesize_stream_raw(text)
-        audio_data = b"".join(audio_stream)
-
-        if not audio_data:
-            print("  [TTS] WARNING: synthesize_stream_raw returned no audio data")
+        if len(wav_bytes) <= 44:
+            print(f"  [TTS] WARNING: synthesize_wav returned no audio data ({len(wav_bytes)} bytes)")
             return
 
-        print(f"  [TTS] Synthesized {len(audio_data)} bytes at {rate}Hz")
+        print(f"  [TTS] Synthesized {len(wav_bytes)} bytes")
 
-        # Write to WAV file manually
-        with wave.open(TTS_OUT_FILE, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(rate)
-            wf.writeframes(audio_data)
-        
+        # Write to disk so aplay can read it
+        with open(TTS_OUT_FILE, "wb") as f:
+            f.write(wav_bytes)
+
         print(f"  [TTS] WAV written: {os.path.getsize(TTS_OUT_FILE)} bytes")
 
-        # Play with aplay
+        # Read sample rate from the WAV header for aplay args
+        buf.seek(0)
+        with wave.open(buf, "rb") as wf:
+            rate = wf.getframerate()
+
         print(f"  [TTS] running: aplay -D {hw_device} -r {rate} -f S16_LE -c 1 {TTS_OUT_FILE}")
         subprocess.run(
             ["aplay", "-D", hw_device, "-r", str(rate), "-f", "S16_LE", "-c", "1", TTS_OUT_FILE],
