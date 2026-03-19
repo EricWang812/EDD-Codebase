@@ -410,9 +410,40 @@ def translate(mt: MTModel, text: str) -> str:
 
 # -----------------------------------------------------------------------------
 # TTS
-# Piper synthesizes to a WAV file via synthesize_wav(), then aplay plays it
-# back directly on the wm8960 card.
+# Piper: phonemize -> flatten -> phonemes_to_ids -> phoneme_ids_to_audio
+# Write raw PCM to WAV, play with aplay on the wm8960 card.
 # -----------------------------------------------------------------------------
+def _piper_synthesize(voice, text: str) -> Optional[np.ndarray]:
+    """
+    Synthesize text to audio using Piper's phoneme pipeline.
+    Returns float32 numpy array normalised to [-1, 1], or None on failure.
+    """
+    # phonemize() returns list of sentences, each a list of phonemes — flatten
+    phonemes_nested = voice.phonemize(text)
+    flat_phonemes = []
+    for sentence in phonemes_nested:
+        if isinstance(sentence, list):
+            flat_phonemes.extend(sentence)
+        else:
+            flat_phonemes.append(sentence)
+
+    phoneme_ids = voice.phonemes_to_ids(flat_phonemes)
+    audio = voice.phoneme_ids_to_audio(phoneme_ids)
+
+    if audio is None or (hasattr(audio, '__len__') and len(audio) == 0):
+        return None
+
+    if isinstance(audio, np.ndarray):
+        if audio.dtype == np.int16:
+            return audio.astype(np.float32) / 32768.0
+        elif audio.max() > 1.0 or audio.min() < -1.0:
+            return audio.astype(np.float32) / 32768.0
+        else:
+            return audio.astype(np.float32)
+    else:
+        return np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+
+
 def speak(app: AppState, text: str, lang: str, hw_device: str):
     if not ENABLE_TTS or not text:
         return
@@ -425,29 +456,26 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
     print(f"  [TTS] lang={lang}, text={text!r}")
 
     try:
-        # synthesize_wav() writes a complete WAV to a file-like object
-        buf = io.BytesIO()
-        voice.synthesize_wav(text, buf)
-        wav_bytes = buf.getvalue()
+        rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
 
-        if len(wav_bytes) <= 44:
-            print(f"  [TTS] WARNING: synthesize_wav returned no audio data ({len(wav_bytes)} bytes)")
+        audio = _piper_synthesize(voice, text)
+        if audio is None:
+            print("  [TTS] WARNING: synthesis returned no audio")
             return
 
-        print(f"  [TTS] Synthesized {len(wav_bytes)} bytes")
+        print(f"  [TTS] Synthesized {len(audio)} samples at {rate}Hz")
 
-        # Write to disk so aplay can read it
-        with open(TTS_OUT_FILE, "wb") as f:
-            f.write(wav_bytes)
+        # Convert float32 back to int16 and write WAV for aplay
+        pcm = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+        with wave.open(TTS_OUT_FILE, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(pcm.tobytes())
 
         print(f"  [TTS] WAV written: {os.path.getsize(TTS_OUT_FILE)} bytes")
-
-        # Read sample rate from the WAV header for aplay args
-        buf.seek(0)
-        with wave.open(buf, "rb") as wf:
-            rate = wf.getframerate()
-
         print(f"  [TTS] running: aplay -D {hw_device} -r {rate} -f S16_LE -c 1 {TTS_OUT_FILE}")
+
         subprocess.run(
             ["aplay", "-D", hw_device, "-r", str(rate), "-f", "S16_LE", "-c", "1", TTS_OUT_FILE],
             check=True
