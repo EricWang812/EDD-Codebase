@@ -79,4 +79,4 @@ fi
 
 echo "Starting translator ..."
 echo ""
-exec python3 "$MAIN_PY" "$@"
+AUDIODEV="hw:${card_index},0" exec python3 "$MAIN_PY" "$@"
