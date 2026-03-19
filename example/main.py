@@ -427,6 +427,7 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
     try:
         # Get sample rate from voice config
         rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
+        print(f"  [TTS] Piper methods: {[m for m in dir(voice) if not m.startswith('_')]}")
 
         # Synthesize raw PCM bytes using stream API
         audio_stream = voice.synthesize_stream_raw(text)
@@ -444,7 +445,7 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
             wf.setsampwidth(2)
             wf.setframerate(rate)
             wf.writeframes(audio_data)
-        print(f"  [TTS] Piper methods: {[m for m in dir(voice) if not m.startswith('_')]}")
+        
         print(f"  [TTS] WAV written: {os.path.getsize(TTS_OUT_FILE)} bytes")
 
         # Play with aplay
