@@ -477,9 +477,9 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
         print(f"  [TTS] running: aplay -D {hw_device} -r {rate} -f S16_LE -c 1 {TTS_OUT_FILE}")
 
         subprocess.run(
-            ["aplay", "-D", "plughw:2,0", TTS_OUT_FILE],
-            check=True
-        )
+    ["aplay", "-D", "plughw:CARD=wm8960soundcard,DEV=0", TTS_OUT_FILE],
+    check=True
+)
 
     except subprocess.CalledProcessError as e:
         print(f"  [TTS] aplay error: {e}")
@@ -508,7 +508,7 @@ def main():
 
     # -- STEP 2: Resolve hw device string from env (set by .sh) ---------------
     card_index = os.environ.get("WM8960_CARD_INDEX", "1").strip()
-    hw_device  = f"plughw:{card_index},0"
+    hw_device = "plughw:CARD=wm8960soundcard,DEV=0"
     print(f"[Audio] output hw device: {hw_device}")
 
     # -- STEP 3: Detect mic input device ---------------------------------------
