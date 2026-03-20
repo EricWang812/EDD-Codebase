@@ -477,7 +477,7 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
         print(f"  [TTS] running: aplay -D {hw_device} -r {rate} -f S16_LE -c 1 {TTS_OUT_FILE}")
 
         subprocess.run(
-            ["aplay", "-D", hw_device, "-r", str(rate), "-f", "S16_LE", "-c", "1", TTS_OUT_FILE],
+            ["aplay", "-D", "plughw:2,0", TTS_OUT_FILE],
             check=True
         )
 
