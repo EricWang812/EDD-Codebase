@@ -529,9 +529,13 @@ def main():
     # -- STEP 3: Set speaker volume --------------------------------------------
     card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard")
     try:
+        env = os.environ.copy()
+        env.pop("ALSA_CONFIG_PATH", None)
+
         subprocess.run(
             ["amixer", "-D", f"hw:{card_name}", "sset", "Speaker", "121"],
-            check=True, capture_output=True, text=True
+            check=True, capture_output=True, text=True,
+            env=env
         )
         print("[Audio] Speaker volume set to 121")
     except Exception as e:
