@@ -480,10 +480,16 @@ def speak(app: AppState, text: str, lang: str):
         print(f"  [TTS] WAV written: {size} bytes")
         print(f"  [TTS] Playing via aplay device: {APLAY_DEVICE}")
 
+        # Strip ALSA_CONFIG_PATH so aplay uses the full system ALSA config
+        # where plughw:CARD=wm8960soundcard,DEV=0 is resolvable
+        env = os.environ.copy()
+        env.pop("ALSA_CONFIG_PATH", None)
+
         result = subprocess.run(
             ["aplay", "-D", APLAY_DEVICE, TTS_OUT_FILE],
             capture_output=True,
-            text=True
+            text=True,
+            env=env
         )
 
         if result.returncode != 0:
