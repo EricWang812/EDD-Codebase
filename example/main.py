@@ -533,11 +533,11 @@ def main():
         env.pop("ALSA_CONFIG_PATH", None)
 
         subprocess.run(
-            ["amixer", "-D", f"hw:{card_name}", "sset", "Speaker", "121"],
+            ["amixer", "-D", f"hw:{card_name}", "sset", "Speaker", "127"],
             check=True, capture_output=True, text=True,
             env=env
         )
-        print("[Audio] Speaker volume set to 121")
+        print("[Audio] Speaker volume set to 127")
     except Exception as e:
         print(f"[Audio] Could not set speaker volume: {e}")
 
