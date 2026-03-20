@@ -95,6 +95,9 @@ CONVO_TIMEOUT  = 10.0  # seconds — inactivity -> back to IDLE
 
 ENABLE_TTS = True
 
+# Hardcoded aplay device — confirmed working via aplay -L
+APLAY_DEVICE = "plughw:CARD=wm8960soundcard,DEV=0"
+
 # -----------------------------------------------------------------------------
 # Data classes
 # -----------------------------------------------------------------------------
@@ -204,7 +207,7 @@ def _load_image(board, filepath: str):
 
 
 def update_display(board, state: State, images: dict):
-    key = state.name.lower()  # "idle" / "listening" / "processing"
+    key = state.name.lower()
     img = images.get(key)
     if img:
         board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img)
@@ -411,11 +414,11 @@ def translate(mt: MTModel, text: str) -> str:
 # -----------------------------------------------------------------------------
 # TTS
 # Piper: phonemize -> flatten -> phonemes_to_ids -> phoneme_ids_to_audio
-# Write raw PCM to WAV, play with aplay on the wm8960 card.
+# Write raw PCM to WAV file, play with aplay using confirmed working device.
 # -----------------------------------------------------------------------------
 def _piper_synthesize(voice, text: str) -> Optional[np.ndarray]:
     """
-    Synthesize text to audio using Piper's phoneme pipeline.
+    Synthesize text using Piper's phoneme pipeline.
     Returns float32 numpy array normalised to [-1, 1], or None on failure.
     """
     # phonemize() returns list of sentences, each a list of phonemes — flatten
@@ -444,7 +447,7 @@ def _piper_synthesize(voice, text: str) -> Optional[np.ndarray]:
         return np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def speak(app: AppState, text: str, lang: str, hw_device: str):
+def speak(app: AppState, text: str, lang: str):
     if not ENABLE_TTS or not text:
         return
 
@@ -465,7 +468,7 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
 
         print(f"  [TTS] Synthesized {len(audio)} samples at {rate}Hz")
 
-        # Convert float32 back to int16 and write WAV for aplay
+        # Convert float32 back to int16 and write WAV
         pcm = (audio * 32767).clip(-32768, 32767).astype(np.int16)
         with wave.open(TTS_OUT_FILE, "wb") as wf:
             wf.setnchannels(1)
@@ -473,18 +476,26 @@ def speak(app: AppState, text: str, lang: str, hw_device: str):
             wf.setframerate(rate)
             wf.writeframes(pcm.tobytes())
 
-        print(f"  [TTS] WAV written: {os.path.getsize(TTS_OUT_FILE)} bytes")
-        print(f"  [TTS] running: aplay -D {hw_device} -r {rate} -f S16_LE -c 1 {TTS_OUT_FILE}")
+        size = os.path.getsize(TTS_OUT_FILE)
+        print(f"  [TTS] WAV written: {size} bytes")
+        print(f"  [TTS] Playing via aplay device: {APLAY_DEVICE}")
 
-        subprocess.run(
-    ["aplay", "-D", "plughw:CARD=wm8960soundcard,DEV=0", TTS_OUT_FILE],
-    check=True
-)
+        result = subprocess.run(
+            ["aplay", "-D", APLAY_DEVICE, TTS_OUT_FILE],
+            capture_output=True,
+            text=True
+        )
 
-    except subprocess.CalledProcessError as e:
-        print(f"  [TTS] aplay error: {e}")
+        if result.returncode != 0:
+            print(f"  [TTS] aplay stderr: {result.stderr.strip()}")
+            print(f"  [TTS] aplay stdout: {result.stdout.strip()}")
+        else:
+            print("  [TTS] Playback complete.")
+
     except Exception as e:
+        import traceback
         print(f"  [TTS] Error: {e}")
+        traceback.print_exc()
 
 # -----------------------------------------------------------------------------
 # Main
@@ -506,15 +517,10 @@ def main():
     else:
         print("[Display] WARNING: idle image missing or failed to load.")
 
-    # -- STEP 2: Resolve hw device string from env (set by .sh) ---------------
-    card_index = os.environ.get("WM8960_CARD_INDEX", "1").strip()
-    hw_device = "plughw:CARD=wm8960soundcard,DEV=0"
-    print(f"[Audio] output hw device: {hw_device}")
-
-    # -- STEP 3: Detect mic input device ---------------------------------------
+    # -- STEP 2: Detect mic input device ---------------------------------------
     in_device = _find_sd_input_device()
 
-    # -- STEP 4: Set speaker volume --------------------------------------------
+    # -- STEP 3: Set speaker volume --------------------------------------------
     card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard")
     try:
         subprocess.run(
@@ -525,7 +531,9 @@ def main():
     except Exception as e:
         print(f"[Audio] Could not set speaker volume: {e}")
 
-    # -- STEP 5: Load models ---------------------------------------------------
+    print(f"[Audio] output device: {APLAY_DEVICE}")
+
+    # -- STEP 4: Load models ---------------------------------------------------
     app = init_app()
 
     # -- Shared mutable state --------------------------------------------------
@@ -601,7 +609,7 @@ def main():
         out = translate(mt, text)
         print(f"  [{direction}] {text}\n  ->  {out}  [{time.time()-t0:.2f}s]")
 
-        speak(app, out, tgt_lang, hw_device)
+        speak(app, out, tgt_lang)
 
         eng_to_cn[0]     = not eng_to_cn[0]
         last_activity[0] = time.time()
