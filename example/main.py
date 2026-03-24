@@ -90,7 +90,7 @@ MIC_SAMPLE_RATE  = 16_000
 MIC_CHANNELS     = 1
 MIC_BLOCK_SEC    = 0.25
 
-HOLD_DURATION  = 1.0   # seconds — long press threshold
+HOLD_DURATION  = 0.40   # seconds — long press threshold
 CONVO_TIMEOUT  = 10.0  # seconds — inactivity -> back to IDLE
 
 ENABLE_TTS = True
@@ -515,13 +515,14 @@ def main():
         "idle":       _load_image(board, os.path.join(IMGS_DIR, "passive.jpg")),
         "listening":  _load_image(board, os.path.join(IMGS_DIR, "listening.jpg")),
         "processing": _load_image(board, os.path.join(IMGS_DIR, "talking.jpg")),
+        "loading":    _load_image(board, os.path.join(IMGS_DIR, "loading.jpg")),
     }
 
-    if images["idle"]:
-        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, images["idle"])
-        print("[Display] Idle image shown.")
+    if images["loading"]:
+        board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, images["loading"])
+        print("[Display] Loading image shown.")
     else:
-        print("[Display] WARNING: idle image missing or failed to load.")
+        print("[Display] WARNING: loading image missing or failed to load.")
 
     # -- STEP 2: Detect mic input device ---------------------------------------
     in_device = _find_sd_input_device()
@@ -636,7 +637,7 @@ def main():
     set_state(State.IDLE)
     print("Button: LONG press  (hold >=1s then release) = English speaker first (EN->ZH)")
     print("        SHORT press (tap and release)        = Chinese speaker first (ZH->EN)")
-
+    
     # -- Main loop — inactivity watchdog ---------------------------------------
     try:
         while True:
