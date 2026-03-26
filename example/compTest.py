@@ -1,11 +1,4 @@
-"""
-PC Translator (Windows + Pi) — EN <-> ZH
-Vosk STT  +  CTranslate2 OPUS MT  +  Piper TTS (Python package)
-
-Install deps once:
-    pip install vosk ctranslate2 sentencepiece sounddevice numpy pyttsx3 piper-tts
-"""
-
+#Whisplay Module translated to laptop devices
 from __future__ import annotations
 
 import io
@@ -31,20 +24,6 @@ try:
 except ImportError:
     PIPER_AVAILABLE = False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Windows UTF-8 fix
-# ─────────────────────────────────────────────────────────────────────────────
-if os.name == "nt":
-    os.system("chcp 65001 >nul")
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
-except Exception:
-    pass
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Paths
-# ─────────────────────────────────────────────────────────────────────────────
 HERE       = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(HERE, "models")
 DATA_DIR   = os.path.join(HERE, "data")
