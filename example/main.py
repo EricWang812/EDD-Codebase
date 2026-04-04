@@ -3,6 +3,7 @@ WhisPlay HAT Translator — EN <-> ZH
 Vosk STT  +  CTranslate2 OPUS MT  +  Piper TTS
 
 Hardware: WhisPlay HAT (Raspberry Pi / Radxa)
+  - Button very long press (>=5.0s) = shutdown
   - Button long press  (>=0.4s) = start with English speaker first (EN->ZH)
   - Button short press (<0.4s) = start with Chinese speaker first (ZH->EN)
   - Press again while recording = stop -> translate -> speak -> swap sides
@@ -82,9 +83,9 @@ MIC_SAMPLE_RATE  = 16_000
 MIC_CHANNELS     = 1
 MIC_BLOCK_SEC    = 0.25
 
-HOLD_DURATION  = 0.3
+HOLD_DURATION    = 0.3
 SHUTOFF_DURATION = 5.0
-CONVO_TIMEOUT  = 15.0
+CONVO_TIMEOUT    = 15.0
 
 ENABLE_TTS = True
 
@@ -518,7 +519,12 @@ def main():
     def on_release():
         if state[0] == State.IDLE:
             duration = time.time() - press_time[0]
-            if duration >= HOLD_DURATION:
+            if duration >= SHUTOFF_DURATION:
+                print(f"[BTN] Very long press ({duration:.2f}s) -> Shutting down")
+                board.cleanup()
+                subprocess.run(["sudo", "shutdown", "-h", "now"])
+                return
+            elif duration >= HOLD_DURATION:
                 eng_to_cn[0] = True
                 print(f"[BTN] Long press ({duration:.2f}s) -> English first (EN->ZH)")
             else:
@@ -573,9 +579,10 @@ def main():
     board.on_button_release(on_release)
 
     set_state(State.IDLE)
-    print("Button: LONG press  (>=0.4s) = English speaker first (EN->ZH)")
+    print("Button: VERY LONG press (>=5.0s) = shutdown")
+    print("        LONG press  (>=0.4s) = English speaker first (EN->ZH)")
     print("        SHORT press (<0.4s)  = Chinese speaker first (ZH->EN)")
-    
+
     try:
         while True:
             if state[0] != State.IDLE:
