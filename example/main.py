@@ -82,12 +82,12 @@ MIC_SAMPLE_RATE  = 16_000
 MIC_CHANNELS     = 1
 MIC_BLOCK_SEC    = 0.25
 
-HOLD_DURATION  = 0.40   # seconds — long press threshold
-CONVO_TIMEOUT  = 10.0  # seconds — inactivity -> back to IDLE
+HOLD_DURATION  = 0.3
+SHUTOFF_DURATION = 5.0
+CONVO_TIMEOUT  = 15.0
 
 ENABLE_TTS = True
 
-# Hardcoded aplay device — confirmed working via aplay -L
 APLAY_DEVICE = "plughw:CARD=wm8960soundcard,DEV=0"
 
 # Classes
@@ -108,14 +108,8 @@ class AppState:
 
 # Audio Device Detection
 def _find_sd_input_device() -> Optional[int]:
-    """
-    Find the wm8960 sounddevice index for input (microphone).
-    Tries multiple strategies including card index, known name variants,
-    and simple-card fallback.
-    """
     card_idx  = os.environ.get("WM8960_CARD_INDEX", "").strip()
     card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard").lower()
-
     try:
         devices = sd.query_devices()
 
@@ -214,15 +208,11 @@ def _load_ct2(model_dir: str) -> MTModel:
 
 def _load_piper_voice(onnx_path: str):
     json_path = onnx_path + ".json"
-    try:
-        return PiperVoice.load(
-            onnx_path,
-            config_path=json_path if os.path.isfile(json_path) else None,
-            use_cuda=False,
-        )
-    except Exception as e:
-        print(f"[Piper] load error: {e}")
-        return None
+    return PiperVoice.load(
+        onnx_path,
+        config_path=json_path if os.path.isfile(json_path) else None,
+        use_cuda=False,
+    )
 
 
 def init_app() -> AppState:
@@ -264,7 +254,6 @@ def record_until_button(stop_event, in_device=None) -> str:
     max_blocks = int(MAX_RECORD_SEC / MIC_BLOCK_SEC)
     frames = []
 
-    print("  [MIC] Recording — press button to stop ...")
     with sd.InputStream(samplerate=MIC_SAMPLE_RATE, channels=MIC_CHANNELS,
                         dtype="int16", blocksize=block_size,
                         device=in_device) as stream:
@@ -274,7 +263,6 @@ def record_until_button(stop_event, in_device=None) -> str:
             block, _ = stream.read(block_size)
             frames.append(block.copy())
 
-    print("  [MIC] Recording stopped.")
     audio = np.concatenate(frames, axis=0)
     with wave.open(REC_FILE, "wb") as wf:
         wf.setnchannels(MIC_CHANNELS)

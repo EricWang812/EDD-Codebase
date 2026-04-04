@@ -1,0 +1,9 @@
+# pip install -r requirements.txt --break-system-packages
+
+vosk
+ctranslate2
+sentencepiece
+sounddevice
+numpy
+piper-tts
+pillow

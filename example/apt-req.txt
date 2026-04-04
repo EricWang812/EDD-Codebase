@@ -1,0 +1,11 @@
+# xargs sudo apt install -y < apt-packages.txt
+
+espeak-ng
+libportaudio2
+portaudio19-dev
+alsa-utils
+python3-pip
+python3-dev
+libffi-dev
+libssl-dev
+libasound2-dev

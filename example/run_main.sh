@@ -1,27 +1,19 @@
-#!/bin/bash
-# run_translator.sh — launch the WhisPlay EN<->ZH translator on Raspberry Pi
-# Usage:
-#   sudo bash run_translator.sh
 set -euo pipefail
 
 echo "=== Sound cards (aplay -l) ==="
 aplay -l 2>/dev/null || true
 echo ""
 
-# ── Find wm8960 card index ────────────────────────────────────────────────────
 card_index=$(awk '/wm8960soundcard/ {print $1}' /proc/asound/cards | head -n1)
-# Default to 1 if not found
 if [ -z "$card_index" ]; then
   card_index=1
 fi
 echo "Using sound card index: $card_index"
 
-# ── Export audio env vars for Python ─────────────────────────────────────────
 export WM8960_CARD_INDEX="$card_index"
 export WM8960_CARD_NAME="wm8960soundcard"
 export AUDIODEV="hw:${card_index},0"
 
-# ── Write a temporary ALSA config so arecord/aplay CLI tools use wm8960 ──────
 ASOUNDRC_TMP=$(mktemp /tmp/.asoundrc.XXXXXX)
 cleanup() { rm -f "$ASOUNDRC_TMP"; }
 trap cleanup EXIT INT TERM
@@ -39,7 +31,6 @@ ctl.!default {
 EOF
 export ALSA_CONFIG_PATH="$ASOUNDRC_TMP"
 
-# ── Thread limits — important on Pi Zero 2W ──────────────────────────────────
 export OMP_NUM_THREADS=2
 export OPENBLAS_NUM_THREADS=2
 export MKL_NUM_THREADS=2
