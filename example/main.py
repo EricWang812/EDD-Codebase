@@ -1,41 +1,17 @@
 """
-WhisPlay HAT Translator — EN <-> TH
-Vosk STT  +  CTranslate2 HPLT MT  +  PyThaiTTS (Thai) / espeak-ng (English)
+WhisPlay HAT Translator — EN <-> ZH
+Vosk STT  +  CTranslate2 OPUS MT  +  Piper TTS
 
 Hardware: WhisPlay HAT (Raspberry Pi / Radxa)
-  - Button very long press (>=2.0s) = shutdown
-  - Button long press  (>=0.4s) = start with English speaker first (EN->TH)
-  - Button short press (<0.4s)  = start with Thai speaker first (TH->EN)
+  - Button very long press (>=5.0s) = shutdown
+  - Button long press  (>=0.4s) = start with English speaker first (EN->ZH)
+  - Button short press (<0.4s) = start with Chinese speaker first (ZH->EN)
   - Press again while recording = stop -> translate -> speak -> swap sides
   - 10s inactivity timeout = return to IDLE, requires fresh button press
 
 Install deps:
-    pip install vosk ctranslate2 sentencepiece sounddevice numpy pythaitts pythainlp pillow
+    pip install vosk ctranslate2 sentencepiece sounddevice numpy piper-tts pillow
     sudo apt install espeak-ng libportaudio2 portaudio19-dev alsa-utils
-
-Model setup:
-    # Download and convert HPLT Marian models to CTranslate2 format
-    pip install huggingface_hub
-    python -c "
-    from huggingface_hub import snapshot_download
-    snapshot_download('HPLT/translate-th-en-v2.0-hplt', local_dir='models/hplt-th-en')
-    snapshot_download('HPLT/translate-en-th-v2.0-hplt', local_dir='models/hplt-en-th')
-    "
-    ct2-opus-mt-converter \
-        --model_path models/hplt-th-en/model.npz.best-chrf.npz \
-        --vocab_path  models/hplt-th-en/model.th-en.spm \
-        --output_dir  models/hplt-th-en-ct2 \
-        --quantization int8
-    ct2-opus-mt-converter \
-        --model_path models/hplt-en-th/model.npz.best-chrf.npz \
-        --vocab_path  models/hplt-en-th/model.en-th.spm \
-        --output_dir  models/hplt-en-th-ct2 \
-        --quantization int8
-
-    # Download Vosk Thai model (vistec-AI/commonvoice-th release)
-    mkdir -p models/vosk-th
-    wget https://github.com/vistec-AI/commonvoice-th/releases/download/vosk-v1/model.zip
-    unzip model.zip -d models/vosk-th
 """
 
 from __future__ import annotations
@@ -60,21 +36,12 @@ import vosk
 import ctranslate2
 import sentencepiece as spm
 
-# PyThaiTTS — Thai TTS
 try:
-    from pythaitts import TTS as ThaiTTS
-    PYTHAITTS_AVAILABLE = True
+    from piper.voice import PiperVoice
+    PIPER_AVAILABLE = True
 except ImportError:
-    PYTHAITTS_AVAILABLE = False
-    print("[WARN] pythaitts not installed — run: pip install pythaitts")
-
-# PyThaiNLP — Thai word tokeniser (used before translation)
-try:
-    from pythainlp.tokenize import word_tokenize as th_word_tokenize
-    PYTHAINLP_AVAILABLE = True
-except ImportError:
-    PYTHAINLP_AVAILABLE = False
-    print("[WARN] pythainlp not installed — run: pip install pythainlp")
+    PIPER_AVAILABLE = False
+    print("[WARN] piper-tts not installed — run: pip install piper-tts")
 
 _DRIVER_DIR = os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Driver")
@@ -82,129 +49,111 @@ _DRIVER_DIR = os.path.abspath(
 sys.path.insert(0, _DRIVER_DIR)
 from WhisPlay import WhisPlayBoard
 
-
-# ---------------------------------------------------------------------------
 # States
-# ---------------------------------------------------------------------------
 class State(Enum):
     IDLE       = 0
     LISTENING  = 1
     PROCESSING = 2
 
-
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
+# File Paths
 HERE       = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(HERE, "models")
 DATA_DIR   = os.path.join(HERE, "data")
+VOICES_DIR = os.path.join(HERE, "voices")
 IMGS_DIR   = os.path.join(HERE, "imgs")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-REC_FILE     = os.path.join(DATA_DIR, "recorded_voice.wav")
-TTS_OUT_FILE = os.path.join(DATA_DIR, "tts_out.wav")
+REC_FILE      = os.path.join(DATA_DIR, "recorded_voice.wav")
+TTS_OUT_FILE  = os.path.join(DATA_DIR, "tts_out.wav")
+VOSK_EN_DIR   = os.path.join(MODELS_DIR, "vosk-en")
+VOSK_ZH_DIR   = os.path.join(MODELS_DIR, "vosk-cn")
+CT2_EN_ZH_DIR = os.path.join(MODELS_DIR, "opus-en-zh-ct2")
+CT2_ZH_EN_DIR = os.path.join(MODELS_DIR, "opus-zh-en-ct2")
+VOICE_EN      = os.path.join(VOICES_DIR, "en_US-lessac-low.onnx")
+VOICE_ZH      = os.path.join(VOICES_DIR, "zh_CN-huayan-x_low.onnx")
 
-# Vosk models
-VOSK_EN_DIR = os.path.join(MODELS_DIR, "vosk-en")
-VOSK_TH_DIR = os.path.join(MODELS_DIR, "vosk-th")
-
-# CTranslate2 HPLT models (converted from Marian via ct2-opus-mt-converter)
-CT2_EN_TH_DIR = os.path.join(MODELS_DIR, "hplt-en-th-ct2")
-CT2_TH_EN_DIR = os.path.join(MODELS_DIR, "hplt-th-en-ct2")
-
-# SPM vocab files (from the original Marian download)
-SPM_EN_TH = os.path.join(MODELS_DIR, "hplt-en-th", "model.en-th.spm")
-SPM_TH_EN = os.path.join(MODELS_DIR, "hplt-th-en", "model.th-en.spm")
-
-
-# ---------------------------------------------------------------------------
-# Tunable constants
-# ---------------------------------------------------------------------------
+# Model and Device Settings
 CT2_COMPUTE_TYPE       = "int8"
-CT2_BEAM_SIZE          = 4
+CT2_BEAM_SIZE          = 2
 CT2_MAX_DECODING_LEN   = 256
 CT2_NO_REPEAT_NGRAM    = 3
 CT2_REPETITION_PENALTY = 1.15
 
-MIC_SAMPLE_RATE = 16_000
-MIC_CHANNELS    = 1
-MIC_BLOCK_SEC   = 0.25
+MIC_SAMPLE_RATE  = 16_000
+MIC_CHANNELS     = 1
+MIC_BLOCK_SEC    = 0.25
 
-HOLD_DURATION   = 0.4   # seconds — long press threshold
-SHUTOFF_DURATION = 2.0  # seconds — very long press = shutdown
-CONVO_TIMEOUT   = 10.0  # seconds — idle timeout during conversation
+HOLD_DURATION    = 0.3
+SHUTOFF_DURATION = 2.0
+CONVO_TIMEOUT    = 10.0
 
 ENABLE_TTS = True
 
-# PyThaiTTS model choice: "lunarlist_onnx" | "vachana" | "khanomtan"
-THAI_TTS_MODEL  = "lunarlist_onnx"
-# vachana speaker options: th_f_1, th_m_1, th_f_2, th_m_2
-THAI_TTS_SPEAKER = "th_f_1"
-
-# espeak-ng voice for English output
-ESPEAK_EN_VOICE = "en-us"
-ESPEAK_RATE     = 160   # words-per-minute
-
 APLAY_DEVICE = "plughw:CARD=wm8960soundcard,DEV=0"
 
-
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
+# Classes
 @dataclass
 class MTModel:
     translator: ctranslate2.Translator
-    sp:         spm.SentencePieceProcessor  # shared src+tgt sentencepiece vocab
-
+    sp_src:     spm.SentencePieceProcessor
+    sp_tgt:     spm.SentencePieceProcessor
 
 @dataclass
 class AppState:
-    vosk_en:   vosk.Model
-    vosk_th:   vosk.Model
-    en_th:     MTModel
-    th_en:     MTModel
-    thai_tts:  object   # ThaiTTS instance or None
+    vosk_en:  vosk.Model
+    vosk_zh:  vosk.Model
+    en_zh:    MTModel
+    zh_en:    MTModel
+    piper_en: object
+    piper_zh: object
 
-
-# ---------------------------------------------------------------------------
-# Audio device detection
-# ---------------------------------------------------------------------------
+# Audio Device Detection
 def _find_sd_input_device() -> Optional[int]:
     card_idx  = os.environ.get("WM8960_CARD_INDEX", "").strip()
     card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard").lower()
     try:
         devices = sd.query_devices()
 
-        for i, d in enumerate(devices):
-            if card_idx.isdigit() and f"hw:{card_idx}" in d["name"] and d["max_input_channels"] > 0:
-                print(f"[Audio] input device {i}: {d['name']!r}")
-                return i
+        # Strategy 1 — hw:N prefix
+        if card_idx.isdigit():
+            hw = f"hw:{card_idx}"
+            for i, d in enumerate(devices):
+                if hw in d["name"] and d["max_input_channels"] > 0:
+                    print(f"[Audio] input device {i}: {d['name']!r}")
+                    return i
+
+        # Strategy 2 — card name substring
         for i, d in enumerate(devices):
             if card_name in d["name"].lower() and d["max_input_channels"] > 0:
                 print(f"[Audio] input device {i}: {d['name']!r}")
                 return i
+
+        # Strategy 3 — wm8960 anywhere
         for i, d in enumerate(devices):
             if "wm8960" in d["name"].lower() and d["max_input_channels"] > 0:
                 print(f"[Audio] input device {i}: {d['name']!r}")
                 return i
-        for i, d in enumerate(devices):
-            if card_idx.isdigit() and f":{card_idx}" in d["name"] and d["max_input_channels"] > 0:
-                print(f"[Audio] input device {i}: {d['name']!r}")
-                return i
+
+        # Strategy 4 — card index in name (e.g. ":2")
+        if card_idx.isdigit():
+            for i, d in enumerate(devices):
+                if f":{card_idx}" in d["name"] and d["max_input_channels"] > 0:
+                    print(f"[Audio] input device {i}: {d['name']!r}")
+                    return i
+
+        # Strategy 5 — simple-card fallback (common on Pi with wm8960)
         for i, d in enumerate(devices):
             if "simple-card" in d["name"].lower() and d["max_input_channels"] > 0:
                 print(f"[Audio] input device {i}: {d['name']!r}")
                 return i
+
     except Exception as e:
         print(f"[Audio] Device scan error: {e}")
 
     print("[Audio] WARNING: wm8960 input not found — using sounddevice default")
     return None
 
-
-# ---------------------------------------------------------------------------
-# Display helpers
-# ---------------------------------------------------------------------------
+# Screen Display Helpers
 def _load_image(board, filepath: str):
     """Load an image as RGB565 for the WhisPlay LCD with aspect-ratio crop."""
     try:
@@ -244,55 +193,52 @@ def update_display(board, state: State, images: dict):
     if img:
         board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, img)
 
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-def _load_ct2(model_dir: str, spm_path: str) -> MTModel:
-    """Load a CTranslate2 Marian model with its shared SPM vocab file."""
-    if not os.path.isfile(os.path.join(model_dir, "model.bin")):
-        raise FileNotFoundError(f"CT2 model.bin missing in: {model_dir}")
-    if not os.path.isfile(spm_path):
-        raise FileNotFoundError(f"SPM vocab missing: {spm_path}")
-
+# Loading Models
+def _load_ct2(model_dir: str) -> MTModel:
+    for f in ("model.bin", "source.spm", "target.spm"):
+        p = os.path.join(model_dir, f)
+        if not os.path.isfile(p):
+            raise FileNotFoundError(p)
     translator = ctranslate2.Translator(model_dir, compute_type=CT2_COMPUTE_TYPE)
-    sp = spm.SentencePieceProcessor()
-    sp.load(spm_path)
-    return MTModel(translator, sp)
+    sp_src = spm.SentencePieceProcessor()
+    sp_src.load(os.path.join(model_dir, "source.spm"))
+    sp_tgt = spm.SentencePieceProcessor()
+    sp_tgt.load(os.path.join(model_dir, "target.spm"))
+    return MTModel(translator, sp_src, sp_tgt)
 
 
-def _load_thai_tts() -> Optional[object]:
-    """Load PyThaiTTS model. Returns None if unavailable."""
-    if not PYTHAITTS_AVAILABLE:
-        return None
-    try:
-        print(f"Loading PyThaiTTS ({THAI_TTS_MODEL}) ...")
-        tts = ThaiTTS(pretrained=THAI_TTS_MODEL)
-        print("PyThaiTTS loaded.")
-        return tts
-    except Exception as e:
-        print(f"[WARN] PyThaiTTS failed to load: {e}")
-        return None
+def _load_piper_voice(onnx_path: str):
+    json_path = onnx_path + ".json"
+    return PiperVoice.load(
+        onnx_path,
+        config_path=json_path if os.path.isfile(json_path) else None,
+        use_cuda=False,
+    )
 
 
 def init_app() -> AppState:
     print("Loading Vosk EN ...")
     vosk_en = vosk.Model(VOSK_EN_DIR)
-    print("Loading Vosk TH ...")
-    vosk_th = vosk.Model(VOSK_TH_DIR)
-    print("Loading EN->TH model ...")
-    en_th = _load_ct2(CT2_EN_TH_DIR, SPM_EN_TH)
-    print("Loading TH->EN model ...")
-    th_en = _load_ct2(CT2_TH_EN_DIR, SPM_TH_EN)
-    thai_tts = _load_thai_tts()
+    print("Loading Vosk ZH ...")
+    vosk_zh = vosk.Model(VOSK_ZH_DIR)
+    print("Loading EN->ZH model ...")
+    en_zh = _load_ct2(CT2_EN_ZH_DIR)
+    print("Loading ZH->EN model ...")
+    zh_en = _load_ct2(CT2_ZH_EN_DIR)
+
+    piper_en = piper_zh = None
+    if PIPER_AVAILABLE:
+        print("Loading Piper EN voice ...")
+        piper_en = _load_piper_voice(VOICE_EN)
+        print("Loading Piper ZH voice ...")
+        piper_zh = _load_piper_voice(VOICE_ZH)
+        loaded = [n for n, v in [("EN", piper_en), ("ZH", piper_zh)] if v]
+        print(f"Piper voices loaded: {loaded if loaded else 'none'}")
 
     print("\nReady.\n")
-    return AppState(vosk_en, vosk_th, en_th, th_en, thai_tts)
+    return AppState(vosk_en, vosk_zh, en_zh, zh_en, piper_en, piper_zh)
 
-
-# ---------------------------------------------------------------------------
-# Audio pre-processing
-# ---------------------------------------------------------------------------
+# Pre-processing Audio
 def _normalize_audio(audio: np.ndarray) -> np.ndarray:
     peak = np.abs(audio.astype(np.float32)).max()
     if peak < 1:
@@ -302,10 +248,7 @@ def _normalize_audio(audio: np.ndarray) -> np.ndarray:
         return audio
     return np.clip(audio.astype(np.float32) * scale, -32768, 32767).astype(np.int16)
 
-
-# ---------------------------------------------------------------------------
-# Recording
-# ---------------------------------------------------------------------------
+# Recording helpers
 def record_until_button(stop_event, in_device=None) -> str:
     MAX_RECORD_SEC = 30
     block_size = int(MIC_SAMPLE_RATE * MIC_BLOCK_SEC)
@@ -329,12 +272,8 @@ def record_until_button(stop_event, in_device=None) -> str:
         wf.writeframes(audio.tobytes())
     return REC_FILE
 
-
-# ---------------------------------------------------------------------------
-# Transcription
-# ---------------------------------------------------------------------------
+# Transcription helpers
 _FILLER_RE = re.compile(r'\b(uh+|um+|hmm+|huh|mm+|ah+|er+)\b', re.IGNORECASE)
-
 
 def _strip_fillers(text: str) -> str:
     return ' '.join(_FILLER_RE.sub('', text).split())
@@ -403,53 +342,25 @@ def _dedup_stt(text: str) -> str:
     return " ".join(deduped)
 
 
-# ---------------------------------------------------------------------------
-# Thai word tokenisation (needed before feeding Thai text to MT model)
-# ---------------------------------------------------------------------------
-def _tokenize_thai_for_mt(text: str) -> str:
-    """
-    Insert spaces between Thai words so the SPM tokeniser sees clean input.
-    Falls back to raw text if PyThaiNLP is unavailable.
-    """
-    if not PYTHAINLP_AVAILABLE:
-        return text
-    tokens = th_word_tokenize(text, engine="newmm")
-    return " ".join(t for t in tokens if t.strip())
-
-
-# ---------------------------------------------------------------------------
 # Translation
-# ---------------------------------------------------------------------------
 def _split_sentences(text: str) -> List[str]:
     parts = re.split(r'(?<=[。！？；.!?;])\s*', text)
     return [p.strip() for p in parts if p.strip()]
 
 
 def _clean(text: str) -> str:
-    # Collapse repeated Thai substrings (MT artifact)
-    text = re.sub(r'([\u0e00-\u0e7f]{2,6})\1{2,}', r'\1', text)
+    text = re.sub(r'([\u4e00-\u9fff\u3000-\u303f]{2,6})\1{2,}', r'\1', text)
     return " ".join(text.split()).strip()
 
 
-def translate(mt: MTModel, text: str, src_lang: str) -> str:
-    """
-    Translate text with a CTranslate2 HPLT Marian model.
-
-    For Thai source text, word-tokenise first so the SPM encoder gets
-    space-separated input rather than a continuous character stream.
-
-    HPLT models converted with ct2-opus-mt-converter handle </s> internally —
-    do NOT append it manually.
-    """
+def translate(mt: MTModel, text: str) -> str:
     if not text.strip():
         return ""
-
-    if src_lang == "th":
-        text = _tokenize_thai_for_mt(text)
-
     results = []
     for sent in (_split_sentences(text) or [text]):
-        toks = mt.sp.encode(sent, out_type=str)
+        toks = mt.sp_src.encode(sent, out_type=str)
+        if mt.sp_src.piece_to_id("</s>") != mt.sp_src.unk_id():
+            toks = toks + ["</s>"]
         res = mt.translator.translate_batch(
             [toks],
             beam_size=CT2_BEAM_SIZE,
@@ -457,100 +368,94 @@ def translate(mt: MTModel, text: str, src_lang: str) -> str:
             no_repeat_ngram_size=CT2_NO_REPEAT_NGRAM,
             repetition_penalty=CT2_REPETITION_PENALTY,
         )
-        out = [t for t in res[0].hypotheses[0]
-               if t not in {"</s>", "<s>", "<pad>", "<unk>"}]
-        results.append(mt.sp.decode(out).strip())
+        out = [t for t in res[0].hypotheses[0] if t not in {"</s>", "<s>", "<pad>"}]
+        results.append(mt.sp_tgt.decode(out).strip())
     return _clean(" ".join(results))
 
 
-# ---------------------------------------------------------------------------
-# TTS
-# ---------------------------------------------------------------------------
-def _aplay(wav_path: str):
-    """Play a WAV file through the wm8960 soundcard via aplay."""
-    env = os.environ.copy()
-    env.pop("ALSA_CONFIG_PATH", None)
-    result = subprocess.run(
-        ["aplay", "-D", APLAY_DEVICE, wav_path],
-        capture_output=True, text=True, env=env
-    )
-    if result.returncode != 0:
-        print(f"  [TTS] aplay stderr: {result.stderr.strip()}")
+def _piper_synthesize(voice, text: str) -> Optional[np.ndarray]:
+    phonemes_nested = voice.phonemize(text)
+    flat_phonemes = []
+    for sentence in phonemes_nested:
+        if isinstance(sentence, list):
+            flat_phonemes.extend(sentence)
+        else:
+            flat_phonemes.append(sentence)
+
+    phoneme_ids = voice.phonemes_to_ids(flat_phonemes)
+    audio = voice.phoneme_ids_to_audio(phoneme_ids)
+
+    if audio is None or (hasattr(audio, '__len__') and len(audio) == 0):
+        return None
+
+    if isinstance(audio, np.ndarray):
+        if audio.dtype == np.int16:
+            return audio.astype(np.float32) / 32768.0
+        elif audio.max() > 1.0 or audio.min() < -1.0:
+            return audio.astype(np.float32) / 32768.0
+        else:
+            return audio.astype(np.float32)
     else:
-        print("  [TTS] Playback complete.")
-
-
-def _speak_thai(thai_tts, text: str):
-    """
-    Synthesise Thai text with PyThaiTTS and play via aplay.
-    PyThaiTTS writes directly to a WAV file; we then play that file.
-    """
-    if thai_tts is None:
-        print("  [TTS] PyThaiTTS not available — skipping Thai speech.")
-        return
-    try:
-        kwargs = {"filename": TTS_OUT_FILE}
-        # vachana model supports speaker_idx; others silently ignore it
-        if THAI_TTS_MODEL == "vachana":
-            kwargs["speaker_idx"] = THAI_TTS_SPEAKER
-
-        out_path = thai_tts.tts(text, **kwargs)
-        print(f"  [TTS-TH] Written: {out_path}")
-        _aplay(TTS_OUT_FILE)
-    except Exception as e:
-        import traceback
-        print(f"  [TTS-TH] Error: {e}")
-        traceback.print_exc()
-
-
-def _speak_english(text: str):
-    """
-    Synthesise English text with espeak-ng, capture WAV output and play via
-    aplay so the audio goes through the wm8960 soundcard (not the default
-    ALSA device that espeak-ng would use directly).
-    """
-    try:
-        env = os.environ.copy()
-        env.pop("ALSA_CONFIG_PATH", None)
-
-        # espeak-ng -w writes a 16-bit mono WAV at its native rate (usually 22050 Hz)
-        result = subprocess.run(
-            [
-                "espeak-ng",
-                "-v", ESPEAK_EN_VOICE,
-                "-s", str(ESPEAK_RATE),
-                "-w", TTS_OUT_FILE,
-                text,
-            ],
-            capture_output=True, text=True, env=env
-        )
-        if result.returncode != 0:
-            print(f"  [TTS-EN] espeak-ng stderr: {result.stderr.strip()}")
-            return
-        print(f"  [TTS-EN] espeak-ng wrote {os.path.getsize(TTS_OUT_FILE)} bytes")
-        _aplay(TTS_OUT_FILE)
-    except FileNotFoundError:
-        print("  [TTS-EN] espeak-ng not found — install with: sudo apt install espeak-ng")
-    except Exception as e:
-        import traceback
-        print(f"  [TTS-EN] Error: {e}")
-        traceback.print_exc()
+        return np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 def speak(app: AppState, text: str, lang: str):
-    """Dispatch TTS to the correct engine based on target language."""
     if not ENABLE_TTS or not text:
         return
+
+    voice = app.piper_zh if lang == "zh" else app.piper_en
+    if not voice:
+        print(f"  [TTS] No voice loaded for lang={lang}")
+        return
+
     print(f"  [TTS] lang={lang}, text={text!r}")
-    if lang == "th":
-        _speak_thai(app.thai_tts, text)
-    else:
-        _speak_english(text)
 
+    try:
+        rate = getattr(getattr(voice, "config", None), "sample_rate", 22050)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+        audio = _piper_synthesize(voice, text)
+        if audio is None:
+            print("  [TTS] WARNING: synthesis returned no audio")
+            return
+
+        print(f"  [TTS] Synthesized {len(audio)} samples at {rate}Hz")
+
+        # Convert float32 back to int16 and write WAV
+        pcm = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+        with wave.open(TTS_OUT_FILE, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(pcm.tobytes())
+
+        size = os.path.getsize(TTS_OUT_FILE)
+        print(f"  [TTS] WAV written: {size} bytes")
+        print(f"  [TTS] Playing via aplay device: {APLAY_DEVICE}")
+
+        # Strip ALSA_CONFIG_PATH so aplay uses the full system ALSA config
+        # where plughw:CARD=wm8960soundcard,DEV=0 is resolvable
+        env = os.environ.copy()
+        env.pop("ALSA_CONFIG_PATH", None)
+
+        result = subprocess.run(
+            ["aplay", "-D", APLAY_DEVICE, TTS_OUT_FILE],
+            capture_output=True,
+            text=True,
+            env=env
+        )
+
+        if result.returncode != 0:
+            print(f"  [TTS] aplay stderr: {result.stderr.strip()}")
+            print(f"  [TTS] aplay stdout: {result.stdout.strip()}")
+        else:
+            print("  [TTS] Playback complete.")
+
+    except Exception as e:
+        import traceback
+        print(f"  [TTS] Error: {e}")
+        traceback.print_exc()
+
+# main
 def main():
     board = WhisPlayBoard()
     board.set_backlight(50)
@@ -565,17 +470,20 @@ def main():
     if images["loading"]:
         board.draw_image(0, 0, board.LCD_WIDTH, board.LCD_HEIGHT, images["loading"])
         print("[Display] Loading image displayed")
+    else:
+        print("[Display] \"Loading\" image not available")
 
     in_device = _find_sd_input_device()
 
-    # Set speaker volume
     card_name = os.environ.get("WM8960_CARD_NAME", "wm8960soundcard")
     try:
         env = os.environ.copy()
         env.pop("ALSA_CONFIG_PATH", None)
+
         subprocess.run(
             ["amixer", "-D", f"hw:{card_name}", "sset", "Speaker", "127"],
-            check=True, capture_output=True, text=True, env=env
+            check=True, capture_output=True, text=True,
+            env=env
         )
         print("[Audio] Speaker volume set to 127")
     except Exception as e:
@@ -583,9 +491,9 @@ def main():
 
     print(f"[Audio] output device: {APLAY_DEVICE}")
 
-    app            = init_app()
+    app = init_app()
     state          = [State.IDLE]
-    eng_to_th      = [True]   # True = EN speaker goes first (EN->TH)
+    eng_to_cn      = [True]
     last_activity  = [0.0]
     press_time     = [0.0]
     stop_recording = threading.Event()
@@ -617,11 +525,11 @@ def main():
                 subprocess.run(["sudo", "shutdown", "-h", "now"])
                 return
             elif duration >= HOLD_DURATION:
-                eng_to_th[0] = True
-                print(f"[BTN] Long press ({duration:.2f}s) -> English speaker first (EN->TH)")
+                eng_to_cn[0] = True
+                print(f"[BTN] Long press ({duration:.2f}s) -> English first (EN->ZH)")
             else:
-                eng_to_th[0] = False
-                print(f"[BTN] Short press ({duration:.2f}s) -> Thai speaker first (TH->EN)")
+                eng_to_cn[0] = False
+                print(f"[BTN] Short press ({duration:.2f}s) -> Chinese first (ZH->EN)")
 
             last_activity[0] = time.time()
             stop_recording.clear()
@@ -637,20 +545,17 @@ def main():
 
         set_state(State.PROCESSING)
 
-        is_en_first = eng_to_th[0]
-        direction   = "EN->TH" if is_en_first else "TH->EN"
-        vosk_model  = app.vosk_en if is_en_first else app.vosk_th
-        mt          = app.en_th   if is_en_first else app.th_en
-        src_lang    = "en"        if is_en_first else "th"
-        tgt_lang    = "th"        if is_en_first else "en"
+        is_en_first = eng_to_cn[0]
+        direction   = "EN->ZH" if is_en_first else "ZH->EN"
+        vosk_model  = app.vosk_en if is_en_first else app.vosk_zh
+        mt          = app.en_zh   if is_en_first else app.zh_en
+        tgt_lang    = "zh"        if is_en_first else "en"
 
         raw  = _transcribe_wav(vosk_model, REC_FILE)
         text = _dedup_stt(raw)
-        print(f"  Recognised ({src_lang}): {text}"
-              + (f"  (raw: {raw})" if raw != text else ""))
+        print(f"  Recognised: {text}" + (f"  (raw: {raw})" if raw != text else ""))
 
         if not text:
-            print("  [STT] Nothing recognised — restarting listener")
             last_activity[0] = time.time()
             stop_recording.clear()
             set_state(State.LISTENING)
@@ -658,13 +563,12 @@ def main():
             return
 
         t0  = time.time()
-        out = translate(mt, text, src_lang)
+        out = translate(mt, text)
         print(f"  [{direction}] {text}\n  ->  {out}  [{time.time()-t0:.2f}s]")
 
         speak(app, out, tgt_lang)
 
-        # Swap direction for the next turn
-        eng_to_th[0]     = not eng_to_th[0]
+        eng_to_cn[0]     = not eng_to_cn[0]
         last_activity[0] = time.time()
 
         stop_recording.clear()
@@ -675,9 +579,9 @@ def main():
     board.on_button_release(on_release)
 
     set_state(State.IDLE)
-    print("Button: VERY LONG press (>=2.0s) = shutdown")
-    print("        LONG  press (>=0.4s) = English speaker first (EN->TH)")
-    print("        SHORT press (<0.4s)  = Thai speaker first (TH->EN)")
+    print("Button: VERY LONG press (>=5.0s) = shutdown")
+    print("        LONG press  (>=0.4s) = English speaker first (EN->ZH)")
+    print("        SHORT press (<0.4s)  = Chinese speaker first (ZH->EN)")
 
     try:
         while True:
